@@ -1,5 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O2 -Iinclude -D__USE_MINGW_ANSI_STDIO=1
+LIBS ?= -lm
 
 SRCS = src/minischeme.c src/minischeme_vm.c src/minischeme_gc.c src/minischeme_prim.c \
        src/minischeme_bigint.c src/minischeme_math.c src/minischeme_fasl.c \
@@ -15,7 +16,7 @@ libminischeme.a: $(OBJS)
 	ar rcs $@ $(OBJS)
 
 minischeme: $(OBJS)
-	$(CC) $(CFLAGS) -DMINISCHEME_MAIN -DMINISCHEME_EMBED_INIT -o $@ $(SRCS)
+	$(CC) $(CFLAGS) -DMINISCHEME_MAIN -DMINISCHEME_EMBED_INIT -o $@ $(OBJS) $(LIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
