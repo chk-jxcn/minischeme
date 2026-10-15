@@ -1,0 +1,46 @@
+name: MiniScheme Core CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        compiler: [gcc]
+        include:
+          - os: ubuntu-latest
+            compiler: clang
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up compiler on Ubuntu
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        if [ "${{ matrix.compiler }}" = "clang" ]; then
+          sudo apt-get install -y clang
+          echo "CC=clang" >> $GITHUB_ENV
+        else
+          sudo apt-get install -y gcc
+          echo "CC=gcc" >> $GITHUB_ENV
+        fi
+
+    - name: Build and Test on Linux
+      if: runner.os == 'Linux'
+      run: |
+        make all
+        ./minischeme -e "(display (+ 10 (* 3 5)))"
+        ./minischeme-vm -h || true
+
+    - name: Build and Test on Windows
+      if: runner.os == 'Windows'
+      run: |
+        gcc -std=c99 -Wall -Wextra -O2 -D__USE_MINGW_ANSI_STDIO=1 -I. -Iinclude -DMINISCHEME_EMBED_INIT -o minischeme.exe src/minischeme.c src/minischeme_gc.c src/minischeme_bigint.c src/minischeme_math.c src/minischeme_vm.c src/minischeme_prim.c src/minischeme_fasl.c src/minischeme_lib.c src/minischeme_gui.c src/minischeme_ili9488.c src/minischeme_fonts.c src/minischeme_fontreg.c src/minischeme_fontrom.c src/minischeme_mirror.c src/minischeme_image.c src/minischeme_cfasl.c src/minischeme_help.c src/minischeme_device.c src/minischeme_jsonfeed.c src/minischeme_api.c src/minischeme_market.c src/minischeme_crypto.c src/minischeme_channel.c
+        .\minischeme.exe -e "(display (+ 10 (* 3 5)))"

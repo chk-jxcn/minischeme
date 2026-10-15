@@ -1,0 +1,21 @@
+# Object and binary outputs
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.so
+*.dylib
+minischeme
+minischeme-vm
+
+# Build directories
+build/
+bin/
+scratch/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
