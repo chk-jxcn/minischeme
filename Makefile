@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O2 -Iinclude -D__USE_MINGW_ANSI_STDIO=1
+CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O2 -Iinclude -D__USE_MINGW_ANSI_STDIO=1 -DMINISCHEME_EMBED_INIT
 LIBS ?= -lm
 
 SRCS = src/minischeme.c src/minischeme_vm.c src/minischeme_gc.c src/minischeme_prim.c \
@@ -16,13 +16,13 @@ libminischeme.a: $(OBJS)
 	ar rcs $@ $(OBJS)
 
 minischeme: $(OBJS)
-	$(CC) $(CFLAGS) -DMINISCHEME_MAIN -DMINISCHEME_EMBED_INIT -o $@ $(OBJS) $(LIBS)
+	$(CC) $(CFLAGS) -DMINISCHEME_MAIN -o $@ $(OBJS) $(LIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 test: minischeme
-	./minischeme -e "(+ 1 2)"
+	./minischeme -e "(display (+ 10 (* 3 5)))"
 	./minischeme -e "(letrec ((fact (lambda (n) (if (<= n 1) 1 (* n (fact (- n 1))))))) (fact 10))"
 
 clean:
