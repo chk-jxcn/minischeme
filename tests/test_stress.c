@@ -129,8 +129,8 @@ static void test_massive_gc_stress(MiniVM *comp_vm, MiniVM *exec_vm) {
     mini_gc(exec_vm);
     size_t final_alloc = mini_get_allocated_bytes(exec_vm);
 
-    snprintf(buf, sizeof(buf), "Baseline: %zu B -> Peak: %zu B -> Post-GC: %zu B (Delta: +%zd B)",
-             base_alloc, peak_heap, final_alloc, (ssize_t)(final_alloc - base_alloc));
+    snprintf(buf, sizeof(buf), "Baseline: %zu B -> Peak: %zu B -> Post-GC: %zu B (Delta: %+lld B)",
+             base_alloc, peak_heap, final_alloc, (long long)final_alloc - (long long)base_alloc);
     /* Retained heap after GC must be clean and bounded */
     check_stress("Cheney GC complete garbage reclamation (Zero Leak)", final_alloc <= base_alloc + 8192, buf);
 }
@@ -249,8 +249,8 @@ static void test_bigint_stress(MiniVM *comp_vm, MiniVM *exec_vm) {
     /* Verify temporary limbs and BigInt intermediates are completely reclaimed */
     mini_gc(exec_vm);
     size_t final_alloc = mini_get_allocated_bytes(exec_vm);
-    snprintf(buf, sizeof(buf), "Pre-BigInt: %zu B -> Post-GC: %zu B (Delta: %zd B)",
-             base_alloc, final_alloc, (ssize_t)(final_alloc - base_alloc));
+    snprintf(buf, sizeof(buf), "Pre-BigInt: %zu B -> Post-GC: %zu B (Delta: %+lld B)",
+             base_alloc, final_alloc, (long long)final_alloc - (long long)base_alloc);
     check_stress("BigInt temporary limb & object GC reclamation", final_alloc <= base_alloc + 8192, buf);
 }
 
@@ -287,14 +287,14 @@ static void test_fault_injection_stress(MiniVM *comp_vm, MiniVM *exec_vm) {
         mini_clear_error(exec_vm);
         if (exec_vm->sp != initial_sp || exec_vm->call_frame_count != 0) {
             all_recovered = false;
-            printf("  [FAIL] Stack leakage detected after error #%d: sp offset=%zd, frame_count=%d\n",
-                   i, exec_vm->sp - initial_sp, exec_vm->call_frame_count);
+            printf("  [FAIL] Stack leakage detected after error #%d: sp offset=%ld, frame_count=%d\n",
+                   i, (long)(exec_vm->sp - initial_sp), exec_vm->call_frame_count);
             break;
         }
     }
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "200 consecutive faults trapped & cleared with 0 SP drift");
+    snprintf(buf, sizeof(buf), "%d consecutive faults trapped & cleared with 0 SP drift", error_count);
     check_stress("Fault Injection: 200 error crashes cleanly recovered", all_recovered, buf);
 
     /* Post-crash functional sanity check: evaluate complex valid expression */

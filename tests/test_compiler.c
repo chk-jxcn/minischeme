@@ -117,7 +117,7 @@ static void eval_test(MiniVM *comp_vm, MiniVM *exec_vm, const char *cat, const c
     Value code_val = mini_call(comp_vm, helper, 1, &s);
     mini_pop_root(comp_vm);
     if (comp_vm->has_error || !mini_is_code(code_val)) {
-        char err[256];
+        char err[600];   /* a prefix and a 512-byte VM error buffer */
         snprintf(err, sizeof(err), "CompileError: %s", comp_vm->has_error ? comp_vm->error_buf : "not code");
         check_result(cat, src, err, expected);
         return;
@@ -136,7 +136,7 @@ static void eval_test(MiniVM *comp_vm, MiniVM *exec_vm, const char *cat, const c
     free(msbc_buf);
 
     if (exec_vm->has_error || !mini_is_code(target_code)) {
-        char err[256];
+        char err[600];   /* a prefix and a 512-byte VM error buffer */
         snprintf(err, sizeof(err), "DeserializeError: %s", exec_vm->has_error ? exec_vm->error_buf : "not code");
         check_result(cat, src, err, expected);
         return;
@@ -146,7 +146,7 @@ static void eval_test(MiniVM *comp_vm, MiniVM *exec_vm, const char *cat, const c
     Value clo = mini_make_closure(exec_vm, target_code, mini_nil());
     Value res = mini_vm_run(exec_vm, clo, 0, NULL);
     if (exec_vm->has_error) {
-        char err[256];
+        char err[600];   /* a prefix and a 512-byte VM error buffer */
         snprintf(err, sizeof(err), "RuntimeError: %s", exec_vm->error_buf);
         check_result(cat, src, err, expected);
         return;
@@ -157,7 +157,7 @@ static void eval_test(MiniVM *comp_vm, MiniVM *exec_vm, const char *cat, const c
     check_result(cat, src, res_str, expected);
 }
 
-int main() {
+int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("======================================================================\n");
     printf("  MiniScheme Scheme Compiler & 200KB Execution VM Test Suite          \n");

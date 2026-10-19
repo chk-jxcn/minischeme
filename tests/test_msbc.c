@@ -283,7 +283,7 @@ static void test_msbc_execution_in_200k_vm(MiniVM *vm) {
     mini_destroy(esp_vm);
 }
 
-int main() {
+int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("====================================================\n");
     printf("  MiniScheme MSBC Binary Protocol Unit Test Suite   \n");
