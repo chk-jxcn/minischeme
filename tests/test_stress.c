@@ -11,12 +11,12 @@
  */
 
 #define MINISCHEME_NO_MAIN 1
-#include "../minischeme.h"
-#include "../minischeme_internal.h"
-#include "../minischeme_lib.h"
-#include "../web_repl/msbc.h"
-#include "../web_repl/init_msbc.h"
-#include "../web_repl/wasm/compiler_msbc.h"
+#include "minischeme.h"
+#include "minischeme_internal.h"
+#include "minischeme_lib.h"
+#include "msbc.h"
+#include "init_msbc.h"
+#include "compiler_msbc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,7 +103,6 @@ static void test_massive_gc_stress(MiniVM *comp_vm, MiniVM *exec_vm) {
     printf("\n--- 1. Cheney GC Deep Stress: 300,000 Object Allocations (200KB Profile) ---\n");
 
     size_t base_alloc = mini_get_allocated_bytes(exec_vm);
-    size_t base_heap = mini_get_heap_size(exec_vm);
 
     /* Allocate 300,000 cons cells in tight 200KB profile (semispace <= 64KB) */
     const char *code =

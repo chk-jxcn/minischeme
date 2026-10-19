@@ -3,46 +3,74 @@ name: MiniScheme Core CI
 on:
   push:
     branches: [ master, main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master, main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-and-test:
+    # make test: the command line's answers are compared, then the MSBC,
+    # compiler/VM and stress suites run (each fails the job on a failed check);
+    # every build uses -Werror
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        compiler: [gcc]
         include:
           - os: ubuntu-latest
-            compiler: clang
+            cc: gcc
+            m32: ''
+          - os: ubuntu-latest
+            cc: clang
+            m32: ''
+          - os: ubuntu-latest
+            cc: gcc
+            m32: '-m32'      # the 32-bit device profile (ESP32 word size)
+          - os: windows-latest
+            cc: gcc
+            m32: ''
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up compiler on Ubuntu
+    - name: Install compilers (Linux)
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        if [ "${{ matrix.compiler }}" = "clang" ]; then
-          sudo apt-get install -y clang
-          echo "CC=clang" >> $GITHUB_ENV
-        else
-          sudo apt-get install -y gcc
-          echo "CC=gcc" >> $GITHUB_ENV
-        fi
+        sudo apt-get install -y gcc clang gcc-multilib make
 
-    - name: Build and Test on Linux
+    - name: Build and test (Linux)
       if: runner.os == 'Linux'
-      run: |
-        make all
-        ./minischeme -e "(display (+ 10 (* 3 5)))"
-        make test
+      run: make CC=${{ matrix.cc }} M32="${{ matrix.m32 }}" test
 
-    - name: Build and Test on Windows
+    - name: Build and test (Windows, MinGW)
       if: runner.os == 'Windows'
+      shell: bash
       run: |
-        gcc -std=c99 -Wall -Wextra -O2 -D__USE_MINGW_ANSI_STDIO=1 -Iinclude -DMINISCHEME_MAIN -DMINISCHEME_EMBED_INIT -o minischeme.exe src/minischeme.c src/minischeme_vm.c src/minischeme_gc.c src/minischeme_prim.c src/minischeme_bigint.c src/minischeme_math.c src/minischeme_fasl.c src/minischeme_cfasl.c src/minischeme_lib.c src/minischeme_help.c src/minischeme_stubs.c
-        .\minischeme.exe -e "(display (+ 10 (* 3 5)))"
-        .\minischeme.exe -e "(letrec ((fact (lambda (n) (if (<= n 1) 1 (* n (fact (- n 1))))))) (fact 10))"
+        MAKE=$(command -v make || command -v mingw32-make)
+        "$MAKE" CC=gcc test
+
+  release:
+    # releases come only from a pushed version tag (git tag v1.0.X)
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Package source archive
+      run: zip -r minischeme-core-source.zip include src scm tests tools Makefile README.md
+
+    - name: Publish release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: "MiniScheme Core (${{ github.ref_name }})"
+        make_latest: true
+        files: minischeme-core-source.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

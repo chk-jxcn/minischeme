@@ -17,13 +17,13 @@
  */
 
 #define MINISCHEME_NO_MAIN 1
-#include "../minischeme.h"
-#include "../minischeme_internal.h"
-#include "../minischeme_lib.h"
-#include "../minischeme_gui.h"
-#include "../web_repl/msbc.h"
-#include "../web_repl/init_msbc.h"
-#include "../web_repl/wasm/compiler_msbc.h"
+#include "minischeme.h"
+#include "minischeme_internal.h"
+#include "minischeme_lib.h"
+#include "minischeme_gui.h"
+#include "msbc.h"
+#include "init_msbc.h"
+#include "compiler_msbc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,6 +325,10 @@ int main() {
     printf("              Semispace: %zu bytes (%.1f KB) [Hard bound <= 64KB]\n", heap_cap, (double)heap_cap / 1024.0);
     assert(heap_cap <= 64 * 1024);
 
+#ifdef MINISCHEME_DEVICE_TESTS
+    /* The GUI, WiFi, peripheral and font primitives live in the device
+     * library (minischeme-esp32 and the WebREPL's WASM build), not in this
+     * core: build with -DMINISCHEME_DEVICE_TESTS and those sources to run them. */
     printf("\n--- 13. GUI & Virtual LCD Primitives (3.5-inch 480x320) ---\n");
     eval_test(comp_vm, exec_vm, "GUI", "(gui-init 480 320)", "#<void>");
     eval_test(comp_vm, exec_vm, "GUI", "(gui-width)", "480");
@@ -411,6 +415,8 @@ int main() {
     eval_test(comp_vm, exec_vm, "Fonts", "(> (gui-text-width \"周一\" 0) 20)", "#t");
     eval_test(comp_vm, exec_vm, "Fonts", "(gui-text-styled 10 10 \"14:32\" 65535 1)", "#<void>");
     eval_test(comp_vm, exec_vm, "Fonts", "(gui-text-box 10 10 200 40 \"14:32\" 65535 1 1 1)", "#<void>");
+
+#endif /* MINISCHEME_DEVICE_TESTS */
 
     printf("\n--- 17. Compressed FASL (CFASL) & Demand-Paged Bytecode ---\n");
     eval_test(comp_vm, exec_vm, "CFASL", "(define s \"ABCDEF1234567890ABCDEF1234567890\")", "s");

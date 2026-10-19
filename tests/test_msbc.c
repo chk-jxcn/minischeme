@@ -12,9 +12,9 @@
  */
 
 #define MINISCHEME_NO_MAIN 1
-#include "../minischeme.h"
-#include "../minischeme_internal.h"
-#include "../web_repl/msbc.h"
+#include "minischeme.h"
+#include "minischeme_internal.h"
+#include "msbc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
