@@ -1189,6 +1189,8 @@ int main(int argc, char **argv) {
 
         if (mini_get_error(vm)) {
             fprintf(stderr, "MiniScheme Error: %s\n", mini_get_error(vm));
+            const char *trace = mini_get_error_trace(vm);
+            if (trace && trace[0]) fprintf(stderr, "%s\n", trace);
             exit_code = 1;
         } else if (!mini_is_void(res)) {
             mini_print_value(vm, res, stdout, true);
@@ -1201,6 +1203,8 @@ int main(int argc, char **argv) {
         Value res = mini_eval_string(vm, eval_expr);
         if (mini_get_error(vm)) {
             fprintf(stderr, "MiniScheme Error: %s\n", mini_get_error(vm));
+            const char *trace = mini_get_error_trace(vm);
+            if (trace && trace[0]) fprintf(stderr, "%s\n", trace);
             exit_code = 1;
         } else if (!mini_is_void(res)) {
             mini_print_value(vm, res, stdout, true);
