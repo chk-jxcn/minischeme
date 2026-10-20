@@ -246,7 +246,8 @@
     { "last-app-stats", "(last-app-stats)", "System / Apps", "Older name of app-last-stats (same procedure, kept for compatibility). Figures of the app that ran before the system settings opened (kept across that restart), or #f." }, \
     { "app-info", "(app-info)", "System / Apps", "The running app: (path id ini-path folder)." }, \
     { "app-list", "(app-list)", "System / Apps", "The installed apps with their metadata: ((path id name description pages version) ...)." }, \
-    { "config-get", "(config-get key)", "System / Configuration", "Value of a key in the running app's own config.ini (its folder), else in /spiffs/config.ini, as a string; #f when neither has it." }, \
+    { "config-get", "(config-get key [app-id])", "System / Configuration", "Value of a key in the running app's own config.ini (its folder), else in /spiffs/config.ini, as a string; #f when neither has it. app-id: a member of the running combined app." }, \
+    { "app-has-config?", "(app-has-config? app-id)", "System / Configuration", "Whether a member of the running combined app ([combo] members) has its own config.ini." }, \
     { "config-set!", "(config-set! section key value)", "System / Configuration", "Write key = value into /spiffs/config.ini (the line replaced in place with its comment kept, else added to [section]); #t when saved. Read again at the next boot." }, \
     { "app-config-set!", "(app-config-set! key value)", "System / Configuration", "Store a setting in the running app's own config.ini ([config] section, in its folder)." }, \
     { "setup-mode-start", "(setup-mode-start)", "System / Setup mode", "Start the setup access point and its web page. Not for apps: only the system settings and the REPL may (an app gets an error)." }, \
@@ -386,7 +387,7 @@
     { "json-feed-selector", "(json-feed-selector i)", "Network / JSON feed", "Index of the selector that row i matched." }, \
     { "json-feed-field", "(json-feed-field i k)", "Network / JSON feed", "Captured value of key k (an index into keys, or since 1.2.0 a key name) for row i, as a string, or #f." }, \
     { "json-feed-url", "(json-feed-url)", "Network / JSON feed", "The URL being polled, or #f." }, \
-    { "json-feed-status", "(json-feed-status)", "Network / JSON feed", "Feed state as an alist: state, error, fetches, failures, bytes, fetch-ms, age-ms, objects, truncated, memory." }, \
+    { "json-feed-status", "(json-feed-status)", "Network / JSON feed", "Feed state as an alist: state, error, fetches, failures, bytes, fetch-ms, age-ms, objects, truncated, memory; on the ESP32 also step (none, clock: waiting for the network time, register: registering with step-server) and step-server." }, \
     { "json-feed-dump", "(json-feed-dump)", "Network / JSON feed", "Every object of a document with captured keys, values joined by TAB, one per line." }, \
     { "fs-read", "(fs-read path)", "Storage / File system", "Read a whole file as a string." }, \
     { "fs-write", "(fs-write path str)", "Storage / File system", "Create or replace a file with the bytes of a string." }, \
