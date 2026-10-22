@@ -204,7 +204,7 @@ simulator's storage (installed apps, `config.ini`) persists in `~/.minischeme-si
 
 ```bash
 cd repos/minischeme-webrepl
-python tools/sim.py --eval "(+ 1 2)" --eval "(api-version)"              # prints 3, "1.6.0"
+python tools/sim.py --eval "(+ 1 2)" --eval "(api-version)"              # prints 3, "1.7.0"
 python tools/sim.py --app weather --wait 5 --shot weather.png            # a bundled app (apps/<id>.msbc)
 python tools/sim.py --app ../minischeme-apps/apps/calendar.msbc --press short --wait 2 --shot month.png
 python tools/sim.py --app my_app.scm --wait 3 --shot my.png --log        # Scheme source, compiled in the page
@@ -219,6 +219,13 @@ the device run (feeds, carousel, clock), `--shot` saves the 320x480 (or 480x320)
 missing app exits with status 1. `--show` opens a visible window. Data requests go through
 the started server like the web page's (its `/api/fetch`), carrying the simulator's
 `SIM-...` id in `X-MiniScheme-Device`.
+
+Scheduled launches (API 1.7, an app's `schedule.ini`) are tested without waiting for the
+clock: `--js "wasmInstance.exports.wasm_schedule_fire(8, 0)"` runs the 08:00 schedule now (a
+scheduled app restarts the simulated device into it; the running app gets its `app-schedule`
+hook). The app must be installed in a folder (`/spiffs/apps/<id>/app.msbc`, not `--app`'s
+root image), e.g. written with `wasm_fs_write` from `--js`; `(app-scheduled)` and
+`(app-return)` behave as on the board.
 
 
 ### Rules for agents
