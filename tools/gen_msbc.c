@@ -6,10 +6,10 @@
  *     gen_msbc init     <scm-dir> <out.h>   -> init_msbc.h     (init_msbc_data)
  *
  * "compiler" compiles <scm-dir>/compiler.scm followed by init.scm into one
- * portable CodeObj: the standalone compiler the WebREPL runs (the reference
- * repository's web_repl/wasm/compiler_msbc.h). "init" compiles the runtime
+ * portable CodeObj: the standalone compiler the WebREPL runs
+ * (minischeme-webrepl wasm/compiler_msbc.h). "init" compiles the runtime
  * forms of init.scm (macros are expanded on the host) into the lean runtime
- * library of the device profile (the reference's web_repl/init_msbc.h).
+ * library of the device profile (init_msbc.h).
  *
  * It must be linked with a core built with -DMINISCHEME_EMBED_INIT: the
  * embedded init image provides read-from-string, macro-expand and
