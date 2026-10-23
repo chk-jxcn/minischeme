@@ -4,6 +4,14 @@
  *
  * Provides a portable binary serialization for CodeObj and constants between
  * WASM (compiler host) and ESP32 / sim_esp32 (execution target).
+ *
+ * Layout: u32 magic "MSBC", u16 version, u16 reserved, then (version 2) the
+ * symbol table: u16 count, each name as u16 length + bytes; then the
+ * top-level code object (no tag byte). Version 2 refers to symbols by index
+ * (MSBC_CONST_SYMREF, u16) instead of writing the name in every constant
+ * pool that uses it: a quarter of an app image was repeated names. Version 1
+ * images (names inline) are still read; msbc_serialize_version(..., 1)
+ * still writes them.
  */
 
 #ifndef MSBC_H
@@ -18,7 +26,8 @@
 #include <stdlib.h>
 
 #define MSBC_MAGIC 0x4342534D /* "MSBC" */
-#define MSBC_VERSION 1
+#define MSBC_VERSION 2          /* written by default */
+#define MSBC_VERSION_MIN 1      /* the oldest still read */
 
 enum {
     MSBC_CONST_FIXNUM = 0,
@@ -32,8 +41,9 @@ enum {
     MSBC_CONST_PAIR   = 8,
     MSBC_CONST_VECTOR = 9,
     MSBC_CONST_LSTRING = 10,  /* string with a u32 length (over 65535 bytes) */
-    MSBC_CONST_BIGINT = 11    /* integer outside the 32-bit targets' fixnums: i8 sign,
+    MSBC_CONST_BIGINT = 11,   /* integer outside the 32-bit targets' fixnums: i8 sign,
                                * u16 limb count, u32 limbs (least significant first) */
+    MSBC_CONST_SYMREF = 12    /* version 2: a symbol by its u16 index in the symbol table */
 };
 
 /* ========================================================================= */
@@ -44,12 +54,14 @@ typedef struct {
     uint8_t *data;
     size_t size;
     size_t cap;
+    Value *syms;        /* version 2: the symbol table, in order of first use */
+    uint32_t nsyms;
+    uint32_t syms_cap;
+    bool symref;        /* constants refer to syms by index */
 } MsbcWriter;
 
 static inline void msbc_writer_init(MsbcWriter *w) {
-    w->data = NULL;
-    w->size = 0;
-    w->cap = 0;
+    memset(w, 0, sizeof(*w));
 }
 
 static inline void msbc_writer_free(MsbcWriter *w) {
@@ -57,8 +69,60 @@ static inline void msbc_writer_free(MsbcWriter *w) {
         free(w->data);
         w->data = NULL;
     }
+    free(w->syms);
+    w->syms = NULL;
+    w->nsyms = w->syms_cap = 0;
     w->size = 0;
     w->cap = 0;
+}
+
+/* The index of symbol v in the writer's table, -1 when absent. Symbols are
+ * interned: the same name is the same Value. A few hundred per app. */
+static inline int32_t msbc_sym_index(const MsbcWriter *w, Value v) {
+    for (uint32_t i = 0; i < w->nsyms; i++) {
+        if (w->syms[i] == v) return (int32_t)i;
+    }
+    return -1;
+}
+
+/* Every symbol among the constants of co and its inner code, once each, in
+ * order of first use; false when out of memory */
+static bool msbc_collect_syms_val(MiniVM *vm, MsbcWriter *w, Value v);
+
+static bool msbc_collect_syms_code(MiniVM *vm, MsbcWriter *w, CodeObj *co) {
+    Value *consts = CODE_CONSTS(co);
+    for (uint16_t i = 0; i < co->num_consts; i++) {
+        if (!msbc_collect_syms_val(vm, w, consts[i])) return false;
+    }
+    return true;
+}
+
+static bool msbc_collect_syms_val(MiniVM *vm, MsbcWriter *w, Value v) {
+    if (mini_is_symbol(v)) {
+        if (msbc_sym_index(w, v) >= 0) return true;
+        if (w->nsyms == w->syms_cap) {
+            uint32_t cap = w->syms_cap ? w->syms_cap * 2 : 256;
+            Value *n = (Value *)realloc(w->syms, cap * sizeof(Value));
+            if (!n) return false;
+            w->syms = n;
+            w->syms_cap = cap;
+        }
+        w->syms[w->nsyms++] = v;
+        return true;
+    }
+    if (mini_is_code(v)) return msbc_collect_syms_code(vm, w, (CodeObj *)UNTAG_PTR(v));
+    while (mini_is_pair(v)) {      /* lists: the cdr chain in a loop */
+        if (!msbc_collect_syms_val(vm, w, mini_car(v))) return false;
+        v = mini_cdr(v);
+    }
+    if (mini_is_symbol(v)) return msbc_collect_syms_val(vm, w, v);
+    if (mini_is_vector(v)) {
+        size_t n = mini_vector_length(v);
+        for (size_t i = 0; i < n && i < 65535; i++) {
+            if (!msbc_collect_syms_val(vm, w, mini_vector_ref(vm, v, i))) return false;
+        }
+    }
+    return true;
 }
 
 static inline void msbc_write_bytes(MsbcWriter *w, const void *ptr, size_t n) {
@@ -142,6 +206,9 @@ static void msbc_serialize_val(MiniVM *vm, MsbcWriter *w, Value v) {
             msbc_write_u16(w, (uint16_t)slen);
         }
         msbc_write_bytes(w, s, slen);
+    } else if (mini_is_symbol(v) && w->symref) {
+        msbc_write_u8(w, MSBC_CONST_SYMREF);
+        msbc_write_u16(w, (uint16_t)msbc_sym_index(w, v));
     } else if (mini_is_symbol(v)) {
         msbc_write_u8(w, MSBC_CONST_SYMBOL);
         const char *s = mini_symbol_name(v);
@@ -188,26 +255,49 @@ static void msbc_serialize_code(MiniVM *vm, MsbcWriter *w, CodeObj *co) {
     }
 }
 
-static inline bool msbc_serialize(MiniVM *vm, Value code_val, uint8_t **out_buf, size_t *out_size) {
+/* code_val as MSBC of the given version (1: names inline, 2: a symbol
+ * table); *out_buf is malloc'ed. Version 2 falls back to 1 for more than
+ * 65535 distinct symbols. */
+static inline bool msbc_serialize_version(MiniVM *vm, Value code_val, uint8_t **out_buf, size_t *out_size,
+                                          uint16_t version) {
     if (!mini_is_code(code_val)) return false;
     CodeObj *co = (CodeObj *)UNTAG_PTR(code_val);
 
     MsbcWriter w;
     msbc_writer_init(&w);
+    if (version >= 2) {
+        if (!msbc_collect_syms_code(vm, &w, co)) {
+            msbc_writer_free(&w);
+            return false;
+        }
+        if (w.nsyms > 65535) version = 1;
+    }
+    w.symref = version >= 2;
 
-    uint32_t magic = MSBC_MAGIC;
-    uint16_t version = MSBC_VERSION;
-    uint16_t reserved = 0;
-
-    msbc_write_u32(&w, magic);
-    msbc_write_u16(&w, version);
-    msbc_write_u16(&w, reserved);
+    msbc_write_u32(&w, MSBC_MAGIC);
+    msbc_write_u16(&w, version >= 2 ? 2 : 1);
+    msbc_write_u16(&w, 0);   /* reserved */
+    if (w.symref) {
+        msbc_write_u16(&w, (uint16_t)w.nsyms);
+        for (uint32_t i = 0; i < w.nsyms; i++) {
+            const char *s = mini_symbol_name(w.syms[i]);
+            size_t slen = strlen(s);
+            if (slen > 65535) slen = 65535;
+            msbc_write_u16(&w, (uint16_t)slen);
+            msbc_write_bytes(&w, s, slen);
+        }
+    }
 
     msbc_serialize_code(vm, &w, co);
 
+    free(w.syms);
     *out_buf = w.data;
     *out_size = w.size;
     return true;
+}
+
+static inline bool msbc_serialize(MiniVM *vm, Value code_val, uint8_t **out_buf, size_t *out_size) {
+    return msbc_serialize_version(vm, code_val, out_buf, out_size, MSBC_VERSION);
 }
 
 /* ========================================================================= */
@@ -219,6 +309,8 @@ typedef struct {
     const uint8_t *end;
     FILE *fp;
     bool error;
+    Value *syms;        /* version 2: a rooted vector of the table's symbols */
+    uint16_t nsyms;
     uint8_t buffer[1024];
 } MsbcReader;
 
@@ -310,6 +402,50 @@ static inline const uint8_t *msbc_read_bytes(MsbcReader *r, size_t n) {
 
 static Value msbc_deserialize_code(MiniVM *vm, MsbcReader *r);
 
+/* A symbol written as u16 length + name, interned */
+static Value msbc_read_symbol(MiniVM *vm, MsbcReader *r) {
+    uint16_t slen = msbc_read_u16(r);
+    char tmp[256];
+    char *buf = (slen < 256) ? tmp : (char *)malloc((size_t)slen + 1);
+    if (!buf || !msbc_read_into(r, (uint8_t *)buf, slen)) {
+        if (buf != tmp && buf) free(buf);
+        r->error = true;
+        return mini_void();
+    }
+    buf[slen] = '\0';
+    Value res = mini_make_symbol(vm, buf);
+    if (buf != tmp) free(buf);
+    return res;
+}
+
+/* The header after the magic: version check, then (version 2) the symbol
+ * table into *syms (a vector the caller has rooted); false on failure */
+static bool msbc_read_header(MiniVM *vm, MsbcReader *r, Value *syms) {
+    uint32_t magic = msbc_read_u32(r);
+    uint16_t version = msbc_read_u16(r);
+    (void)msbc_read_u16(r); /* reserved */
+    if (magic != MSBC_MAGIC || version < MSBC_VERSION_MIN || version > MSBC_VERSION) {
+        vm_error(vm, "invalid MSBC header (magic=0x%08X, ver=%u)", (unsigned)magic, (unsigned)version);
+        return false;
+    }
+    if (version < 2) return true;
+    uint16_t n = msbc_read_u16(r);
+    if (r->error) {
+        vm_error(vm, "truncated MSBC symbol table");
+        return false;
+    }
+    *syms = mini_make_vector(vm, n, mini_void());
+    if (!mini_is_vector(*syms)) return false;
+    for (uint16_t i = 0; i < n && !r->error; i++) {
+        Value sym = msbc_read_symbol(vm, r);
+        mini_vector_set(vm, *syms, i, sym);
+    }
+    r->syms = syms;
+    r->nsyms = n;
+    if (r->error) vm_error(vm, "truncated MSBC symbol table");
+    return !r->error;
+}
+
 static Value msbc_deserialize_val(MiniVM *vm, MsbcReader *r) {
     if (r->error) return mini_void();
     if (r->cur >= r->end) {
@@ -361,19 +497,15 @@ static Value msbc_deserialize_val(MiniVM *vm, MsbcReader *r) {
             if (buf != tmp) free(buf);
             return res;
         }
-        case MSBC_CONST_SYMBOL: {
-            uint16_t slen = msbc_read_u16(r);
-            char tmp[256];
-            char *buf = (slen < 256) ? tmp : (char *)malloc(slen + 1);
-            if (!buf || !msbc_read_into(r, (uint8_t *)buf, slen)) {
-                if (buf != tmp && buf) free(buf);
+        case MSBC_CONST_SYMBOL:
+            return msbc_read_symbol(vm, r);
+        case MSBC_CONST_SYMREF: {
+            uint16_t idx = msbc_read_u16(r);
+            if (!r->syms || idx >= r->nsyms) {
                 r->error = true;
                 return mini_void();
             }
-            buf[slen] = '\0';
-            Value res = mini_make_symbol(vm, buf);
-            if (buf != tmp) free(buf);
-            return res;
+            return mini_vector_ref(vm, *r->syms, idx);
         }
         case MSBC_CONST_NIL:
             return mini_nil();
@@ -467,16 +599,12 @@ static inline Value msbc_deserialize(MiniVM *vm, const uint8_t *buf, size_t size
     r.fp = NULL;
     r.error = false;
 
-    uint32_t magic = msbc_read_u32(&r);
-    uint16_t version = msbc_read_u16(&r);
-    (void)msbc_read_u16(&r); /* reserved */
-
-    if (magic != MSBC_MAGIC || version != MSBC_VERSION) {
-        vm_error(vm, "invalid MSBC header (magic=0x%08X, ver=%u)", (unsigned)magic, (unsigned)version);
-        return mini_void();
-    }
-
-    Value co = msbc_deserialize_code(vm, &r);
+    Value syms = mini_nil();
+    mini_push_root(vm, &syms);
+    bool header_ok = msbc_read_header(vm, &r, &syms);
+    Value co = header_ok ? msbc_deserialize_code(vm, &r) : mini_void();
+    mini_pop_root(vm);
+    if (!header_ok) return mini_void();
     if (r.error || !mini_is_code(co)) {
         vm_error(vm, "failed to deserialize MSBC code object");
         return mini_void();
@@ -499,17 +627,15 @@ static inline Value msbc_deserialize_file(MiniVM *vm, FILE *fp) {
     r->end = r->buffer;
     r->error = false;
 
-    uint32_t magic = msbc_read_u32(r);
-    uint16_t version = msbc_read_u16(r);
-    (void)msbc_read_u16(r);
-
-    if (magic != MSBC_MAGIC || version != MSBC_VERSION) {
-        vm_error(vm, "invalid MSBC header (magic=0x%08X, ver=%u)", (unsigned)magic, (unsigned)version);
+    Value syms = mini_nil();
+    mini_push_root(vm, &syms);
+    bool header_ok = msbc_read_header(vm, r, &syms);
+    Value co = header_ok ? msbc_deserialize_code(vm, r) : mini_void();
+    mini_pop_root(vm);
+    if (!header_ok) {
         free(r);
         return mini_void();
     }
-
-    Value co = msbc_deserialize_code(vm, r);
     if (r->error || !mini_is_code(co)) {
         vm_error(vm, "failed to deserialize MSBC code object from file");
         free(r);

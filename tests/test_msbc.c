@@ -283,6 +283,72 @@ static void test_msbc_execution_in_200k_vm(MiniVM *vm) {
     mini_destroy(esp_vm);
 }
 
+/* ========================================================================= */
+/* Test 5: version 2 (symbol table) against version 1 (names inline)         */
+/* ========================================================================= */
+static void test_msbc_symbol_table(MiniVM *vm) {
+    printf("[MSBC Test] 5. Symbol table (version 2) vs names inline (version 1)...\n");
+
+    /* outer: consts (string-append inner-code display); inner: (string-append display "x") */
+    uint8_t ops[] = { OP_RETURN };
+    Value bytes_vec = mini_make_vector(vm, 1, mini_make_fixnum(ops[0]));
+    mini_push_root(vm, &bytes_vec);
+    Value inner_consts = mini_make_vector(vm, 3, mini_void());
+    mini_push_root(vm, &inner_consts);
+    mini_vector_set(vm, inner_consts, 0, mini_make_symbol(vm, "string-append"));
+    mini_vector_set(vm, inner_consts, 1, mini_make_symbol(vm, "display"));
+    mini_vector_set(vm, inner_consts, 2, mini_make_string(vm, "x"));
+    Value inner = helper_make_code(vm, bytes_vec, inner_consts, 0, 8, false, false);
+    mini_push_root(vm, &inner);
+    Value outer_consts = mini_make_vector(vm, 3, mini_void());
+    mini_push_root(vm, &outer_consts);
+    mini_vector_set(vm, outer_consts, 0, mini_make_symbol(vm, "string-append"));
+    mini_vector_set(vm, outer_consts, 1, inner);
+    mini_vector_set(vm, outer_consts, 2, mini_make_symbol(vm, "display"));
+    Value outer = helper_make_code(vm, bytes_vec, outer_consts, 0, 8, false, true);
+    mini_pop_root(vm);
+    mini_pop_root(vm);
+    mini_pop_root(vm);
+    mini_pop_root(vm);
+    TEST_ASSERT(mini_is_code(outer), "Code with repeated symbols created");
+
+    uint8_t *v1 = NULL, *v2 = NULL;
+    size_t n1 = 0, n2 = 0;
+    TEST_ASSERT(msbc_serialize_version(vm, outer, &v1, &n1, 1), "Version 1 written");
+    TEST_ASSERT(msbc_serialize(vm, outer, &v2, &n2), "Version 2 (the default) written");
+    TEST_ASSERT(v1[4] == 1 && v2[4] == 2, "Version fields 1 and 2");
+    TEST_ASSERT(n2 < n1, "Version 2 is smaller (each name once)");
+    TEST_ASSERT(v2[8] == 2 && v2[9] == 0, "Two symbols in the table");
+
+    for (int ver = 1; ver <= 2; ver++) {
+        Value c = msbc_deserialize(vm, ver == 1 ? v1 : v2, ver == 1 ? n1 : n2);
+        TEST_ASSERT(mini_is_code(c) && !mini_get_error(vm), ver == 1 ? "Version 1 read" : "Version 2 read");
+        if (!mini_is_code(c)) continue;
+        CodeObj *co = (CodeObj *)UNTAG_PTR(c);
+        Value *k = CODE_CONSTS(co);
+        TEST_ASSERT(k[0] == mini_make_symbol(vm, "string-append") && k[2] == mini_make_symbol(vm, "display"),
+                    "Outer symbols interned");
+        TEST_ASSERT(mini_is_code(k[1]), "Inner code read");
+        if (mini_is_code(k[1])) {
+            Value *ik = CODE_CONSTS((CodeObj *)UNTAG_PTR(k[1]));
+            TEST_ASSERT(ik[0] == k[0] && ik[1] == k[2] && mini_is_string(ik[2]), "Inner constants via the table");
+        }
+    }
+
+    /* a symbol index past the table is rejected */
+    uint8_t *bad = (uint8_t *)malloc(n2);
+    memcpy(bad, v2, n2);
+    for (size_t i = 8; i + 2 < n2; i++) {
+        if (bad[i] == MSBC_CONST_SYMREF && bad[i + 1] == 0 && bad[i + 2] == 0) { bad[i + 1] = 9; break; }
+    }
+    Value bc = msbc_deserialize(vm, bad, n2);
+    TEST_ASSERT(!mini_is_code(bc) && mini_get_error(vm), "Out-of-range symbol index rejected");
+    mini_clear_error(vm);
+    free(bad);
+    free(v1);
+    free(v2);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("====================================================\n");
@@ -296,6 +362,7 @@ int main(void) {
     test_msbc_constants_roundtrip(vm);
     test_msbc_nested_code(vm);
     test_msbc_execution_in_200k_vm(vm);
+    test_msbc_symbol_table(vm);
 
     mini_destroy(vm);
 

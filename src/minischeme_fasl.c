@@ -1960,9 +1960,9 @@ static void xrom_reintern(MiniVM *vm) {
 #define RS_IN        512    /* input buffer */
 #define RS_MAX_DEPTH 256    /* nested code / data levels */
 
-/* MSBC constant tags (web_repl/msbc.h) */
+/* MSBC constant tags (msbc.h) */
 enum { RS_FIXNUM = 0, RS_FLONUM, RS_BOOL, RS_STRING, RS_SYMBOL, RS_NIL, RS_VOID, RS_CODE, RS_PAIR, RS_VECTOR, RS_LSTRING,
-       RS_BIGINT };
+       RS_BIGINT, RS_SYMREF };
 
 typedef struct {
     MiniRomReadFn read;
@@ -1980,6 +1980,8 @@ typedef struct {
     size_t sym_n, sym_cap;
     char *name;                    /* the symbol being read */
     size_t name_cap;
+    Value *symtab;                 /* MSBC version 2: the image's symbols by table index */
+    size_t symtab_n;
     size_t mem, peak;
     int depth;
     const char *err;
@@ -2328,6 +2330,12 @@ static Value rs_value(RomStream *s, uint8_t tag) {
         case RS_STRING: v = rs_string(s, rs_u16(s)); break;
         case RS_LSTRING: v = rs_string(s, rs_u32(s)); break;
         case RS_SYMBOL: v = rs_symbol(s); break;
+        case RS_SYMREF: {
+            uint16_t idx = rs_u16(s);
+            if (idx < s->symtab_n) v = s->symtab[idx];
+            else rs_fail(s, "rom: symbol index out of range");
+            break;
+        }
         case RS_NIL: v = mini_nil(); break;
         case RS_VOID: v = mini_void(); break;
         case RS_CODE: v = rs_code(s); break;
@@ -2373,11 +2381,19 @@ size_t mini_rom_build_stream(MiniRomReadFn read, void *read_user, uintptr_t base
     s->win_off = s->cursor = MROM_HDR_BYTES;
     rs_mem(s, (ptrdiff_t)sizeof(RomStream));
 
-    /* MSBC header, then the top-level code object */
+    /* MSBC header, (version 2) its symbol table, then the top-level code object */
     uint32_t magic = rs_u32(s);
     uint16_t version = rs_u16(s);
     (void)rs_u16(s);
-    if (!s->err && (magic != 0x4342534Du || version != 1)) rs_fail(s, "rom: not MSBC bytecode");
+    if (!s->err && (magic != 0x4342534Du || version < 1 || version > 2)) rs_fail(s, "rom: not MSBC bytecode");
+    if (!s->err && version == 2) {
+        size_t n = rs_u16(s);
+        s->symtab = (Value *)malloc((n ? n : 1) * sizeof(Value));
+        if (!s->symtab) rs_fail(s, "rom: out of memory");
+        else rs_mem(s, (ptrdiff_t)(n * sizeof(Value)));
+        for (size_t i = 0; i < n && !s->err; i++) s->symtab[i] = rs_symbol(s);
+        s->symtab_n = s->err ? 0 : n;
+    }
     Value root = s->err ? mini_void() : rs_code(s);  /* no tag byte before the top level */
     rs_flush(s);
 
@@ -2421,6 +2437,7 @@ size_t mini_rom_build_stream(MiniRomReadFn read, void *read_user, uintptr_t base
     free(s->sym_off);
     free(s->sym_hash);
     free(s->name);
+    free(s->symtab);
     free(s);
     return result;
 }
