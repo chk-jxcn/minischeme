@@ -2331,7 +2331,13 @@ static Value rs_value(RomStream *s, uint8_t tag) {
         case RS_LSTRING: v = rs_string(s, rs_u32(s)); break;
         case RS_SYMBOL: v = rs_symbol(s); break;
         case RS_SYMREF: {
-            uint16_t idx = rs_u16(s);
+            size_t idx = 0;
+            for (int shift = 0; shift <= 14; shift += 7) {   /* LEB128, at most 3 bytes */
+                uint8_t b = rs_u8(s);
+                idx |= (size_t)(b & 0x7F) << shift;
+                if (!(b & 0x80)) break;
+                if (shift == 14) idx = SIZE_MAX;
+            }
             if (idx < s->symtab_n) v = s->symtab[idx];
             else rs_fail(s, "rom: symbol index out of range");
             break;

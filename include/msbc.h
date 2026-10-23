@@ -6,12 +6,13 @@
  * WASM (compiler host) and ESP32 / sim_esp32 (execution target).
  *
  * Layout: u32 magic "MSBC", u16 version, u16 reserved, then (version 2) the
- * symbol table: u16 count, each name as u16 length + bytes; then the
- * top-level code object (no tag byte). Version 2 refers to symbols by index
- * (MSBC_CONST_SYMREF, u16) instead of writing the name in every constant
- * pool that uses it: a quarter of an app image was repeated names. Version 1
- * images (names inline) are still read; msbc_serialize_version(..., 1)
- * still writes them.
+ * symbol table: u16 count, each name as u16 length + bytes, the names used
+ * most first; then the top-level code object (no tag byte). Version 2 refers
+ * to symbols by index (MSBC_CONST_SYMREF + the index as a LEB128 varint: one
+ * byte for the 128 most used names) instead of writing the name in every
+ * constant pool that uses it: a quarter of an app image was repeated names.
+ * Version 1 images (names inline) are still read;
+ * msbc_serialize_version(..., 1) still writes them.
  */
 
 #ifndef MSBC_H
@@ -43,7 +44,7 @@ enum {
     MSBC_CONST_LSTRING = 10,  /* string with a u32 length (over 65535 bytes) */
     MSBC_CONST_BIGINT = 11,   /* integer outside the 32-bit targets' fixnums: i8 sign,
                                * u16 limb count, u32 limbs (least significant first) */
-    MSBC_CONST_SYMREF = 12    /* version 2: a symbol by its u16 index in the symbol table */
+    MSBC_CONST_SYMREF = 12    /* version 2: a symbol by its index in the symbol table (LEB128 varint) */
 };
 
 /* ========================================================================= */
@@ -54,7 +55,8 @@ typedef struct {
     uint8_t *data;
     size_t size;
     size_t cap;
-    Value *syms;        /* version 2: the symbol table, in order of first use */
+    Value *syms;        /* version 2: the symbol table (the names used most first) */
+    uint32_t *uses;     /* how often each is referred to */
     uint32_t nsyms;
     uint32_t syms_cap;
     bool symref;        /* constants refer to syms by index */
@@ -70,7 +72,9 @@ static inline void msbc_writer_free(MsbcWriter *w) {
         w->data = NULL;
     }
     free(w->syms);
+    free(w->uses);
     w->syms = NULL;
+    w->uses = NULL;
     w->nsyms = w->syms_cap = 0;
     w->size = 0;
     w->cap = 0;
@@ -99,14 +103,22 @@ static bool msbc_collect_syms_code(MiniVM *vm, MsbcWriter *w, CodeObj *co) {
 
 static bool msbc_collect_syms_val(MiniVM *vm, MsbcWriter *w, Value v) {
     if (mini_is_symbol(v)) {
-        if (msbc_sym_index(w, v) >= 0) return true;
+        int32_t at = msbc_sym_index(w, v);
+        if (at >= 0) {
+            w->uses[at]++;
+            return true;
+        }
         if (w->nsyms == w->syms_cap) {
             uint32_t cap = w->syms_cap ? w->syms_cap * 2 : 256;
             Value *n = (Value *)realloc(w->syms, cap * sizeof(Value));
             if (!n) return false;
             w->syms = n;
+            uint32_t *u = (uint32_t *)realloc(w->uses, cap * sizeof(uint32_t));
+            if (!u) return false;
+            w->uses = u;
             w->syms_cap = cap;
         }
+        w->uses[w->nsyms] = 1;
         w->syms[w->nsyms++] = v;
         return true;
     }
@@ -150,6 +162,15 @@ static inline void msbc_write_u32(MsbcWriter *w, uint32_t v) {
 
 static inline void msbc_write_u64(MsbcWriter *w, uint64_t v) {
     msbc_write_bytes(w, &v, sizeof(v));
+}
+
+/* LEB128: 7 bits a byte, the high bit set on all but the last */
+static inline void msbc_write_varint(MsbcWriter *w, uint32_t v) {
+    while (v >= 0x80) {
+        msbc_write_u8(w, (uint8_t)(v | 0x80));
+        v >>= 7;
+    }
+    msbc_write_u8(w, (uint8_t)v);
 }
 
 static void msbc_serialize_code(MiniVM *vm, MsbcWriter *w, CodeObj *co);
@@ -208,7 +229,7 @@ static void msbc_serialize_val(MiniVM *vm, MsbcWriter *w, Value v) {
         msbc_write_bytes(w, s, slen);
     } else if (mini_is_symbol(v) && w->symref) {
         msbc_write_u8(w, MSBC_CONST_SYMREF);
-        msbc_write_u16(w, (uint16_t)msbc_sym_index(w, v));
+        msbc_write_varint(w, (uint32_t)msbc_sym_index(w, v));
     } else if (mini_is_symbol(v)) {
         msbc_write_u8(w, MSBC_CONST_SYMBOL);
         const char *s = mini_symbol_name(v);
@@ -271,6 +292,19 @@ static inline bool msbc_serialize_version(MiniVM *vm, Value code_val, uint8_t **
             return false;
         }
         if (w.nsyms > 65535) version = 1;
+        /* the names used most first: their indexes take one byte (stable:
+         * equal counts keep the order of first use) */
+        for (uint32_t i = 1; i < w.nsyms; i++) {
+            Value sv = w.syms[i];
+            uint32_t su = w.uses[i], j = i;
+            while (j > 0 && w.uses[j - 1] < su) {
+                w.syms[j] = w.syms[j - 1];
+                w.uses[j] = w.uses[j - 1];
+                j--;
+            }
+            w.syms[j] = sv;
+            w.uses[j] = su;
+        }
     }
     w.symref = version >= 2;
 
@@ -291,6 +325,7 @@ static inline bool msbc_serialize_version(MiniVM *vm, Value code_val, uint8_t **
     msbc_serialize_code(vm, &w, co);
 
     free(w.syms);
+    free(w.uses);
     *out_buf = w.data;
     *out_size = w.size;
     return true;
@@ -500,8 +535,14 @@ static Value msbc_deserialize_val(MiniVM *vm, MsbcReader *r) {
         case MSBC_CONST_SYMBOL:
             return msbc_read_symbol(vm, r);
         case MSBC_CONST_SYMREF: {
-            uint16_t idx = msbc_read_u16(r);
-            if (!r->syms || idx >= r->nsyms) {
+            uint32_t idx = 0;
+            for (int shift = 0; shift <= 14; shift += 7) {   /* at most 3 bytes: indexes below 65536 */
+                uint8_t b = msbc_read_u8(r);
+                idx |= (uint32_t)(b & 0x7F) << shift;
+                if (!(b & 0x80)) break;
+                if (shift == 14) r->error = true;
+            }
+            if (r->error || !r->syms || idx >= r->nsyms) {
                 r->error = true;
                 return mini_void();
             }

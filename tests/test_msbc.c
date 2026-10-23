@@ -339,7 +339,7 @@ static void test_msbc_symbol_table(MiniVM *vm) {
     uint8_t *bad = (uint8_t *)malloc(n2);
     memcpy(bad, v2, n2);
     for (size_t i = 8; i + 2 < n2; i++) {
-        if (bad[i] == MSBC_CONST_SYMREF && bad[i + 1] == 0 && bad[i + 2] == 0) { bad[i + 1] = 9; break; }
+        if (bad[i] == MSBC_CONST_SYMREF && bad[i + 1] < 2) { bad[i + 1] = 9; break; }
     }
     Value bc = msbc_deserialize(vm, bad, n2);
     TEST_ASSERT(!mini_is_code(bc) && mini_get_error(vm), "Out-of-range symbol index rejected");
