@@ -11,6 +11,9 @@
  * to symbols by index (MSBC_CONST_SYMREF + the index as a LEB128 varint: one
  * byte for the 128 most used names) instead of writing the name in every
  * constant pool that uses it: a quarter of an app image was repeated names.
+ * A version 2 code object's header is varints too: code length, parameters,
+ * stack size, flags (1 variadic, 2 inner lambdas), constants; version 1 has
+ * u32, u16, u16, u8, u8, u16.
  * Version 1 images (names inline) are still read;
  * msbc_serialize_version(..., 1) still writes them.
  */
@@ -259,12 +262,20 @@ static void msbc_serialize_val(MiniVM *vm, MsbcWriter *w, Value v) {
 }
 
 static void msbc_serialize_code(MiniVM *vm, MsbcWriter *w, CodeObj *co) {
-    msbc_write_u32(w, co->code_len);
-    msbc_write_u16(w, co->num_params);
-    msbc_write_u16(w, co->max_stack);
-    msbc_write_u8(w, co->is_variadic);
-    msbc_write_u8(w, co->has_inner_lambdas);
-    msbc_write_u16(w, co->num_consts);
+    if (w->symref) {          /* version 2: the header as varints */
+        msbc_write_varint(w, co->code_len);
+        msbc_write_varint(w, co->num_params);
+        msbc_write_varint(w, co->max_stack);
+        msbc_write_u8(w, (uint8_t)((co->is_variadic ? 1 : 0) | (co->has_inner_lambdas ? 2 : 0)));
+        msbc_write_varint(w, co->num_consts);
+    } else {
+        msbc_write_u32(w, co->code_len);
+        msbc_write_u16(w, co->num_params);
+        msbc_write_u16(w, co->max_stack);
+        msbc_write_u8(w, co->is_variadic);
+        msbc_write_u8(w, co->has_inner_lambdas);
+        msbc_write_u16(w, co->num_consts);
+    }
 
     if (co->code_len > 0) {
         msbc_write_bytes(w, CODE_BYTES(co), co->code_len);
@@ -346,6 +357,7 @@ typedef struct {
     bool error;
     Value *syms;        /* version 2: a rooted vector of the table's symbols */
     uint16_t nsyms;
+    uint16_t version;
     uint8_t buffer[1024];
 } MsbcReader;
 
@@ -437,6 +449,18 @@ static inline const uint8_t *msbc_read_bytes(MsbcReader *r, size_t n) {
 
 static Value msbc_deserialize_code(MiniVM *vm, MsbcReader *r);
 
+/* A LEB128 varint of at most 5 bytes (32 bits) */
+static uint32_t msbc_read_varint(MsbcReader *r) {
+    uint32_t v = 0;
+    for (int shift = 0; shift <= 28; shift += 7) {
+        uint8_t b = msbc_read_u8(r);
+        v |= (uint32_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) return v;
+    }
+    r->error = true;
+    return 0;
+}
+
 /* A symbol written as u16 length + name, interned */
 static Value msbc_read_symbol(MiniVM *vm, MsbcReader *r) {
     uint16_t slen = msbc_read_u16(r);
@@ -463,6 +487,7 @@ static bool msbc_read_header(MiniVM *vm, MsbcReader *r, Value *syms) {
         vm_error(vm, "invalid MSBC header (magic=0x%08X, ver=%u)", (unsigned)magic, (unsigned)version);
         return false;
     }
+    r->version = version;
     if (version < 2) return true;
     uint16_t n = msbc_read_u16(r);
     if (r->error) {
@@ -535,13 +560,7 @@ static Value msbc_deserialize_val(MiniVM *vm, MsbcReader *r) {
         case MSBC_CONST_SYMBOL:
             return msbc_read_symbol(vm, r);
         case MSBC_CONST_SYMREF: {
-            uint32_t idx = 0;
-            for (int shift = 0; shift <= 14; shift += 7) {   /* at most 3 bytes: indexes below 65536 */
-                uint8_t b = msbc_read_u8(r);
-                idx |= (uint32_t)(b & 0x7F) << shift;
-                if (!(b & 0x80)) break;
-                if (shift == 14) r->error = true;
-            }
+            uint32_t idx = msbc_read_varint(r);
             if (r->error || !r->syms || idx >= r->nsyms) {
                 r->error = true;
                 return mini_void();
@@ -582,12 +601,28 @@ static Value msbc_deserialize_val(MiniVM *vm, MsbcReader *r) {
 static Value msbc_deserialize_code(MiniVM *vm, MsbcReader *r) {
     if (r->error) return mini_void();
 
-    uint32_t code_len = msbc_read_u32(r);
-    uint16_t num_params = msbc_read_u16(r);
-    uint16_t max_stack = msbc_read_u16(r);
-    uint8_t  is_variadic = msbc_read_u8(r);
-    uint8_t  has_inner_lambdas = msbc_read_u8(r);
-    uint16_t num_consts = msbc_read_u16(r);
+    uint32_t code_len;
+    uint16_t num_params, max_stack, num_consts;
+    uint8_t is_variadic, has_inner_lambdas;
+    if (r->version >= 2) {
+        code_len = msbc_read_varint(r);
+        uint32_t np = msbc_read_varint(r), ms = msbc_read_varint(r);
+        uint8_t flags = msbc_read_u8(r);
+        uint32_t nc = msbc_read_varint(r);
+        if (np > 0xFFFF || ms > 0xFFFF || nc > 0xFFFF) r->error = true;
+        num_params = (uint16_t)np;
+        max_stack = (uint16_t)ms;
+        num_consts = (uint16_t)nc;
+        is_variadic = flags & 1;
+        has_inner_lambdas = (flags >> 1) & 1;
+    } else {
+        code_len = msbc_read_u32(r);
+        num_params = msbc_read_u16(r);
+        max_stack = msbc_read_u16(r);
+        is_variadic = msbc_read_u8(r);
+        has_inner_lambdas = msbc_read_u8(r);
+        num_consts = msbc_read_u16(r);
+    }
 
     if (r->error) return mini_void();
 
