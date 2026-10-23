@@ -807,10 +807,9 @@ void esp32_wifi_early_init(void) {
             esp_event_loop_create_default();
             s_esp32_sta_netif = esp_netif_create_default_wifi_sta();
         }
+        /* the buffer counts of sdkconfig (2 static, 6 dynamic rx, 6 tx): each
+         * static rx buffer holds 1.6 KB for good, the VM heap gets it instead */
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        cfg.static_rx_buf_num = 4;
-        cfg.dynamic_rx_buf_num = 8;
-        cfg.dynamic_tx_buf_num = 8;
         cfg.mgmt_sbuf_num = 8;
         cfg.rx_ba_win = 4;
         esp_err_t err = esp_wifi_init(&cfg);
@@ -1151,6 +1150,21 @@ static Value prim_fs_read(MiniVM *vm, int argc, Value *argv) {
     char *c = hal_fs_read(path, &len);
     if (!c) return mini_false();
     Value res = mini_make_string_len(vm, c, len);   /* binary-safe, as fs-write */
+    free(c);
+    return res;
+}
+
+/* (theme-css) => the system color scheme file /spiffs/theme.css as a string
+ * (any app may read it, outside its folder; nothing else of the system), #f
+ * without one or when it is over 16 KB. The app framework reads it (gui.scm). */
+#define THEME_CSS_PATH "/spiffs/theme.css"
+#define THEME_CSS_MAX  (16 * 1024)
+static Value prim_theme_css(MiniVM *vm, int argc, Value *argv) {
+    (void)argc; (void)argv;
+    size_t len = 0;
+    char *c = hal_fs_read(THEME_CSS_PATH, &len);
+    if (!c) return mini_false();
+    Value res = len <= THEME_CSS_MAX ? mini_make_string_len(vm, c, len) : mini_false();
     free(c);
     return res;
 }
@@ -1754,6 +1768,7 @@ void mini_register_hardware_lib(MiniVM *vm) {
         /* File System */
         { "fs-write",               prim_fs_write },
         { "fs-read",                prim_fs_read },
+        { "theme-css",              prim_theme_css },
         { "fs-exists?",             prim_fs_exists_p },
         { "fs-remove",              prim_fs_remove },
         /* System */
