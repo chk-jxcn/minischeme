@@ -64,6 +64,15 @@
   (if (> (cdr r) 0)
       (set-cdr! r (- (cdr r) 1))))
 
+;; The line (from 1) of byte idx, for error messages
+(define (reader-line r idx)
+  (let ((str (car r)))
+    (let loop ((i 0) (n 1))
+      (if (>= i idx) n (loop (+ i 1) (if (= (string-ref str i) 10) (+ n 1) n))))))
+
+(define (reader-error r idx what)
+  (error (string-append what " at line " (number->string (reader-line r idx)))))
+
 (define (reader-whitespace? c)
   (or (= c 32) (= c 9) (= c 10) (= c 13)))
 
@@ -89,11 +98,12 @@
        (reader-skip-comment r (reader-peek r)))
       (else #t))))
 
-(define (read-list r)
+;; The rest of a list whose "(" is at byte open
+(define (read-list r open)
   (skip-whitespace r)
   (let ((c (reader-peek r)))
     (cond
-      ((not c) (error "unexpected EOF inside list"))
+      ((not c) (reader-error r open "unexpected end of input: no ')' for the '('"))
       ((= c 41) ; ')'
        (reader-get r)
        '())
@@ -108,23 +118,24 @@
                  (let ((close (reader-get r)))
                    (if (and close (= close 41))
                        tail
-                       (error "expected ')' after dotted pair tail")))))
+                       (reader-error r (- (cdr r) 1) "expected ')' after dotted pair tail")))))
              (begin
                (reader-unget r)
                (let* ((head (read-sexpr r))
-                      (tail (read-list r)))
+                      (tail (read-list r open)))
                  (cons head tail))))))
       (else
        (let* ((head (read-sexpr r))
-              (tail (read-list r)))
+              (tail (read-list r open)))
          (cons head tail))))))
 
 (define (read-string-literal r)
+  (define open (cdr r))
   (reader-get r) ; consume opening '"'
   (define (iter-chars chars)
     (let ((c (reader-get r)))
       (cond
-        ((not c) (error "unexpected EOF in string literal"))
+        ((not c) (reader-error r open "unexpected end of input: the string literal is not closed, it starts"))
         ((= c 34) ; '"'
          (list->string (reverse chars)))
         ((= c 92) ; '\' escape
@@ -192,7 +203,7 @@
 (define (read-char-literal r)
   (let ((first (reader-get r)))
     (cond
-      ((not first) (error "unexpected EOF after #\\"))
+      ((not first) (reader-error r (cdr r) "unexpected end of input after #\\"))
       ((>= first 128)
        ;; the rest of a UTF-8 sequence (continuation bytes 128..191) is dropped
        (let skip ()
@@ -217,13 +228,15 @@
                            (else (error (string-append "unknown character name: #\\" name)))))))))))))
 
 (define (read-sharp r)
+  (define open (cdr r))
   (reader-get r) ; consume '#'
   (let ((c (reader-get r)))
     (cond
+      ((not c) (reader-error r open "unexpected end of input after #"))
       ((or (= c 116) (= c 84)) #t) ; #t or #T
       ((or (= c 102) (= c 70)) #f) ; #f or #F
       ((= c 40)      ; #( vector
-       (list->vector (read-list r)))
+       (list->vector (read-list r open)))
       ((= c 92)      ; #\ character
        (read-char-literal r))
       ((or (= c 120) (= c 88)) ; #x or #X (hexadecimal)
@@ -235,14 +248,17 @@
       ((or (= c 100) (= c 68)) ; #d or #D (decimal)
        (read-radix-number r 10))
       (else
-       (error "unknown sharp syntax")))))
+       (reader-error r open "unknown sharp syntax")))))
 
 (define (read-sexpr r)
   (skip-whitespace r)
   (let ((c (reader-peek r)))
     (cond
       ((not c) (eof-object))
-      ((= c 40) (reader-get r) (read-list r))
+      ((= c 40) (reader-get r) (read-list r (- (cdr r) 1)))
+      ;; a ")" no "(" opened: an error (read-atom would make it an empty symbol and stop
+      ;; nowhere, read-from-string asking for the next expression at the same ")" forever)
+      ((= c 41) (reader-error r (cdr r) "unexpected ')' with no '(' to close"))
       ((= c 39) (reader-get r) (list 'quote (read-sexpr r)))
       ((= c 96) (reader-get r) (list 'quasiquote (read-sexpr r)))
       ((= c 44) ; ','

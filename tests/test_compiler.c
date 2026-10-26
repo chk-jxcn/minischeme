@@ -482,6 +482,18 @@ int main(void) {
         mini_clear_error(comp_vm);
     }
 
+    /* Unbalanced source: an error naming the line, never a hang (a stray ")" once made the
+     * reader return empty symbols forever) */
+    eval_test(comp_vm, exec_vm, "Reader", "(define x 1))\n(+ x 1)",
+              "CompileError: unexpected ')' with no '(' to close at line 1");
+    eval_test(comp_vm, exec_vm, "Reader", "(define x 1)\n\n(define (f y)\n  (+ y 1)\n",
+              "CompileError: unexpected end of input: no ')' for the '(' at line 3");
+    eval_test(comp_vm, exec_vm, "Reader", "(define s 1)\n\"open",
+              "CompileError: unexpected end of input: the string literal is not closed, it starts at line 2");
+    eval_test(comp_vm, exec_vm, "Reader", "#(1 2", "CompileError: unexpected end of input: no ')' for the '(' at line 1");
+    eval_test(comp_vm, exec_vm, "Reader", "(car '(7 8)) ; ) in a comment\n\"a ) in a string\"", "\"a ) in a string\"");
+    mini_clear_error(comp_vm);
+
     mini_destroy(comp_vm);
     mini_destroy(exec_vm);
 
