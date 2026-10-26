@@ -9,9 +9,10 @@
 ;;;      - Branch Elimination: (if #t a b) -> a, (if #f a b) -> b
 ;;;      - Algebraic Simplification: (+ x 0) -> x, (* x 1) -> x, (- x 0) -> x
 ;;;   4. Bytecode Code Generator with Tail-Call Optimization (TCO)
-;;;      - Direct Opcode Emission: OP_ADD, OP_SUB, OP_MUL, OP_LT, OP_CONS, etc.
+;;;      - Inline arithmetic (API 1.14): (+ a b) (- a b) (* a b) and the two-argument
+;;;        comparisons of the global procedures become OP_ADD .. OP_NUM_EQ
+;;;        (*inline-arith* #f: calls, for firmware before API 1.14)
 ;;;      - Immediate Integer Packing: OP_INT8 for -128..127
-;;;      - Self-Tail-Call Optimization: OP_TAIL_CALL_SELF
 ;;;   5. eval, eval-string, eval-file
 ;;; =========================================================================
 
@@ -40,6 +41,25 @@
 (define OP_CALL 18)
 (define OP_TAIL_CALL 19)
 (define OP_RETURN 20)
+;; API 1.14: two-argument arithmetic and comparisons (the VM computes two fixnums itself and
+;; calls the primitive for anything else)
+(define OP_ADD 21)
+(define OP_SUB 22)
+(define OP_MUL 23)
+(define OP_LT 24)
+(define OP_GT 25)
+(define OP_LE 26)
+(define OP_GE 27)
+(define OP_NUM_EQ 28)
+
+;; #f: no inline arithmetic, the images run on firmware before API 1.14 (compile_to_hex
+;; --no-inline-arith, a WebREPL target with an older firmware); kept when this file is
+;; loaded again
+(define *inline-arith* (if (%defined? '*inline-arith*) *inline-arith* #t))
+
+(define inline-arith-ops
+  (list (cons '+ OP_ADD) (cons '- OP_SUB) (cons '* OP_MUL) (cons '< OP_LT) (cons '> OP_GT)
+        (cons '<= OP_LE) (cons '>= OP_GE) (cons '= OP_NUM_EQ)))
 
 ;; -------------------------------------------------------------------------
 ;; 2. S-Expression Reader
@@ -936,6 +956,15 @@
               (emit-byte ctx OP_CLOSURE)
               (emit-u16 ctx idx)
               (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))))
+
+         ;; (+ a b), (< a b) ...: an instruction when the name is the global procedure (not a
+         ;; local or captured variable of that name)
+         ((and *inline-arith* (symbol? op) (assq op inline-arith-ops) (pair? args) (pair? (cdr args))
+               (null? (cddr args)) (eq? (car (lookup-var ctx op)) 'global))
+          (compile-expr ctx (car args) #f)
+          (compile-expr ctx (cadr args) #f)
+          (emit-byte ctx (cdr (assq op inline-arith-ops)))
+          (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
          ;; General Procedure Call
          (else

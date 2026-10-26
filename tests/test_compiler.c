@@ -482,6 +482,57 @@ int main(void) {
         mini_clear_error(comp_vm);
     }
 
+    /* Inline arithmetic (API 1.14): (+ a b) ... of the global procedures are instructions; two
+     * fixnums are computed in the VM, anything else goes to the primitive with its results
+     * and errors. Arguments come through procedure parameters so nothing is constant-folded. */
+    printf("\n--- Inline arithmetic ---\n");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (list (+ a b) (- a b) (* a b))) (f 268435455 1)",
+              "(268435456 268435454 268435455)");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (+ a b)) (f 1152921504606846975 1)", "1152921504606846976");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (- a b)) (f -1152921504606846976 1)", "-1152921504606846977");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (* a b)) (list (f 65536 65536) (f 4294967296 4294967296))",
+              "(4294967296 18446744073709551616)");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (* a b)) (list (f -1152921504606846976 -1) (f -268435456 -1) (f 0 -5))",
+              "(1152921504606846976 268435456 0)");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (list (+ a b) (- a b) (* a b))) (f 1 2.5)", "(3.5 -1.5 2.5)");
+    eval_test(comp_vm, exec_vm, "InlineArith",
+              "(define (c a b) (list (< a b) (> a b) (<= a b) (>= a b) (= a b))) (list (c 1 2) (c 2 2) (c -3 -4))",
+              "((#t #f #t #f #f) (#f #f #t #t #t) (#f #t #f #t #f))");
+    eval_test(comp_vm, exec_vm, "InlineArith",
+              "(define (c a b) (list (< a b) (= a b))) (list (c 1 1.5) (c 2 2.0) (c 1 1152921504606846976000))",
+              "((#t #f) (#f #t) (#t #f))");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (+ a b)) (f 1 \"x\")", "RuntimeError: +: expected number");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f a b) (< a b)) (f 'a 1)", "RuntimeError: <: expected numbers");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (f + a) (+ a 1)) (f - 10)", "9");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (mk +) (lambda (a) (+ a 3))) ((mk *) 5)", "15");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define (lp n acc) (if (= n 0) acc (lp (- n 1) (+ acc 2)))) (lp 100000 0)", "200000");
+    eval_test(comp_vm, exec_vm, "InlineArith", "(define x 4) (list (+ 1 2 3 x) (- x) (*) (apply + (list 1 2)) (map + '(1 2) '(10 20)))",
+              "(10 -4 1 3 (11 22))");
+    {
+        /* the instruction is emitted, or a call when *inline-arith* is #f (older firmware) */
+        Value helper = env_lookup_name(comp_vm, "%compile-source-to-code");
+        Value flag = mini_make_symbol(comp_vm, "*inline-arith*");
+        mini_push_root(comp_vm, &flag);
+        for (int on = 1; on >= 0; on--) {
+            mini_clear_error(comp_vm);
+            env_define(comp_vm, comp_vm->global_env, flag, on ? mini_true() : mini_false());
+            Value src = mini_make_string(comp_vm, "(< x y)");
+            Value code = mini_call(comp_vm, helper, 1, &src);
+            bool ok = mini_is_code(code);
+            const uint8_t *b = ok ? CODE_BYTES((CodeObj *)UNTAG_PTR(code)) : NULL;
+            uint32_t n = ok ? ((CodeObj *)UNTAG_PTR(code))->code_len : 0;
+            if (on) ok = ok && n >= 2 && b[n - 2] == OP_LT && b[n - 1] == OP_RETURN;
+            else ok = ok && n >= 3 && b[n - 3] == OP_TAIL_CALL && b[n - 2] == 2;
+            check_result("InlineArith", on ? "(< x y) is OP_LT" : "*inline-arith* #f: a call",
+                         ok ? "yes" : "no", "yes");
+        }
+        env_define(comp_vm, comp_vm->global_env, flag, mini_true());
+        mini_pop_root(comp_vm);
+    }
+    mini_clear_error(comp_vm);
+
     /* Unbalanced source: an error naming the line, never a hang (a stray ")" once made the
      * reader return empty symbols forever) */
     eval_test(comp_vm, exec_vm, "Reader", "(define x 1))\n(+ x 1)",
