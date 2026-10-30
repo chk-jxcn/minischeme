@@ -103,6 +103,87 @@ static char *format_value(MiniVM *vm, Value val) {
     return buf;
 }
 
+/* ---- running from a Code ROM, as the firmware does (global slots, MROM version 2) ---- */
+#define TEST_ROM_BYTES (256 * 1024)
+#define TEST_ROM_KEY 0x7E57u
+static uint8_t g_test_rom[TEST_ROM_BYTES];
+typedef struct { const uint8_t *buf; size_t len, pos; } RomIn;
+
+static size_t rom_in(void *dst, size_t n, void *user) {
+    RomIn *in = (RomIn *)user;
+    size_t k = in->len - in->pos < n ? in->len - in->pos : n;
+    memcpy(dst, in->buf + in->pos, k);
+    in->pos += k;
+    return k;
+}
+
+static bool rom_out(size_t off, const void *data, size_t len, void *user) {
+    (void)user;
+    if (off + len > TEST_ROM_BYTES) return false;
+    memcpy(g_test_rom + off, data, len);
+    return true;
+}
+
+/* src compiled, its Code ROM built and run in a fresh device-sized VM (4 KB eden: GCs often) */
+static void rom_test(MiniVM *comp_vm, const char *cat, const char *src, const char *expected) {
+    char result[600];
+    mini_clear_error(comp_vm);
+    Value s = mini_make_string(comp_vm, src);
+    mini_push_root(comp_vm, &s);
+    Value code = mini_call(comp_vm, env_lookup_name(comp_vm, "%compile-source-to-code"), 1, &s);
+    mini_pop_root(comp_vm);
+    uint8_t *msbc = NULL;
+    size_t len = 0;
+    if (comp_vm->has_error || !mini_is_code(code) || !msbc_serialize(comp_vm, code, &msbc, &len)) {
+        snprintf(result, sizeof(result), "CompileError: %s", comp_vm->has_error ? comp_vm->error_buf : "not code");
+        check_result(cat, src, result, expected);
+        return;
+    }
+    memset(g_test_rom, 0xFF, sizeof(g_test_rom));
+    RomIn in = { msbc, len, 0 };
+    const char *err = NULL;
+    size_t size = mini_rom_build_stream(rom_in, &in, (uintptr_t)g_test_rom, NULL, TEST_ROM_KEY, rom_out, NULL, NULL, &err);
+    free(msbc);
+    MiniConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.eden_bytes = 4096;
+    cfg.initial_heap_bytes = 256 * 1024;
+    cfg.skip_init_fasl = true;
+    MiniVM *vm = mini_create_ext(&cfg);
+    Value root = size ? mini_rom_attach(vm, g_test_rom, TEST_ROM_BYTES, TEST_ROM_KEY) : mini_void();
+    if (!mini_is_code(root)) {
+        snprintf(result, sizeof(result), "RomError: %s", err ? err : "fails verification");
+    } else {
+        Value clo = mini_make_closure(vm, root, mini_nil());
+        mini_push_root(vm, &clo);
+        Value res = mini_vm_run(vm, clo, 0, NULL);
+        mini_pop_root(vm);
+        if (vm->has_error) snprintf(result, sizeof(result), "RuntimeError: %s", vm->error_buf);
+        else snprintf(result, sizeof(result), "%s", format_value(vm, res));
+    }
+    mini_destroy(vm);
+    check_result(cat, src, result, expected);
+}
+
+/* the last instructions of src compiled for target API (major * 1000 + minor) */
+static bool code_ends_with(MiniVM *comp_vm, int api, const char *src, const uint8_t *tail, size_t n) {
+    Value flag = mini_make_symbol(comp_vm, "*target-api*");
+    mini_push_root(comp_vm, &flag);
+    env_define(comp_vm, comp_vm->global_env, flag, mini_make_fixnum(api));
+    Value s = mini_make_string(comp_vm, src);
+    Value code = mini_call(comp_vm, env_lookup_name(comp_vm, "%compile-source-to-code"), 1, &s);
+    bool ok = mini_is_code(code);
+    if (ok) {
+        const uint8_t *b = CODE_BYTES((CodeObj *)UNTAG_PTR(code));
+        uint32_t len = ((CodeObj *)UNTAG_PTR(code))->code_len;
+        ok = len >= n && memcmp(b + len - n, tail, n) == 0;
+    }
+    env_define(comp_vm, comp_vm->global_env, flag, mini_make_fixnum(1015));
+    mini_pop_root(comp_vm);
+    mini_clear_error(comp_vm);
+    return ok;
+}
+
 static void eval_test(MiniVM *comp_vm, MiniVM *exec_vm, const char *cat, const char *src, const char *expected) {
     mini_clear_error(comp_vm);
     Value s = mini_make_string(comp_vm, src);
@@ -532,6 +613,53 @@ int main(void) {
         mini_pop_root(comp_vm);
     }
     mini_clear_error(comp_vm);
+
+    /* API 1.15: car cdr not null? pair? eq? vector-ref inline, API procedures by number */
+    printf("\n--- API procedures by number, inline procedures ---\n");
+    eval_test(comp_vm, exec_vm, "InlinePrim",
+              "(define (f p v) (list (car p) (cdr p) (not p) (not #f) (null? '()) (null? p) (pair? p) (pair? 5) (eq? p p) (eq? p (cons 1 2)) (vector-ref v 1))) (f (cons 1 2) (vector 7 8 9))",
+              "(1 2 #f #t #t #f #t #f #t #f 8)");
+    eval_test(comp_vm, exec_vm, "InlinePrim", "(define (f a b) (if (eq? a b) 'same (if (null? a) 'empty (if (not (pair? a)) 'atom 'pair)))) (list (f 1 1) (f '() 2) (f 3 4) (f '(1) 2))",
+              "(same empty atom pair)");
+    eval_test(comp_vm, exec_vm, "InlinePrim", "(define (f x) (car x)) (f 5)", "RuntimeError: car: requires a pair (got fixnum)");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "InlinePrim", "(define (f v) (vector-ref v 3)) (f (vector 1 2))", "RuntimeError: vector-ref: index 3 out of bounds (length 2)");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "CallPrim",
+              "(define (f x) (list (length x) (append x x) (string-append \"a\" \"b\" \"c\" \"d\") (apply + x) (map (lambda (n) (* n n)) x) (reverse x))) (f (list 1 2 3))",
+              "(3 (1 2 3 1 2 3) \"abcd\" 6 (1 4 9) (3 2 1))");
+    eval_test(comp_vm, exec_vm, "CallPrim", "(define (f) (+ 1 (call/cc (lambda (k) (k 41))))) (f)", "42");
+    eval_test(comp_vm, exec_vm, "CallPrim", "(define (f s) (string-length s)) (f 5)", "RuntimeError: string-length: expected string");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "CallPrim", "(define (f l) (if (null? l) 'done (f (cdr l)))) (f (list 1 2 3))", "done");
+    eval_test(comp_vm, exec_vm, "CallPrim", "(define (car x) 'mine) (define (list . a) 'mine-too) (list (car '(1)) 2)", "mine-too");
+    eval_test(comp_vm, exec_vm, "CallPrim", "(define (car x) 'mine) (car '(1))", "mine");
+    {
+        static const uint8_t car_op[] = { OP_CAR, OP_RETURN };
+        static const uint8_t car_call[] = { OP_TAIL_CALL, 1, OP_RETURN };
+        uint8_t prim_call[5] = { OP_CALL_PRIM, 0, 0, 1, OP_RETURN };
+        Value sym = mini_make_symbol(comp_vm, "list");
+        Value id = prim_api_id(comp_vm, 1, &sym);
+        prim_call[1] = (uint8_t)(mini_to_fixnum(id) & 0xFF);
+        prim_call[2] = (uint8_t)(mini_to_fixnum(id) >> 8);
+        check_result("TargetApi", "(car x) for 1.15: OP_CAR", code_ends_with(comp_vm, 1015, "(car x)", car_op, 2) ? "yes" : "no", "yes");
+        check_result("TargetApi", "(car x) for 1.14: a call", code_ends_with(comp_vm, 1014, "(car x)", car_call, 3) ? "yes" : "no", "yes");
+        check_result("TargetApi", "(list x) for 1.15: OP_CALL_PRIM", mini_is_fixnum(id) && code_ends_with(comp_vm, 1015, "(list x)", prim_call, 5) ? "yes" : "no", "yes");
+        check_result("TargetApi", "(list x) for 1.13: a call", code_ends_with(comp_vm, 1013, "(list x)", car_call, 3) ? "yes" : "no", "yes");
+    }
+
+    /* From a Code ROM: global slots (defined, set!, redefined, looked up before definition),
+     * GCs every 4 KB moving the bindings, the self tail call, branches on comparisons */
+    printf("\n--- From a Code ROM (global slots) ---\n");
+    rom_test(comp_vm, "CodeRom", "(define x 1) (define (bump!) (set! x (+ x 1))) (bump!) (bump!) x", "3");
+    rom_test(comp_vm, "CodeRom", "(define (f) (g)) (define (g) 'first) (define a (f)) (define (g) 'second) (list a (f))", "(first second)");
+    rom_test(comp_vm, "CodeRom",
+             "(define keep '()) (define (lp n acc) (if (= n 0) acc (begin (set! keep (cons n keep)) (lp (- n 1) (+ acc (car keep)))))) (list (lp 20000 0) (length keep))",
+             "(200010000 20000)");
+    rom_test(comp_vm, "CodeRom", "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 20)", "6765");
+    rom_test(comp_vm, "CodeRom", "(define (count l n) (if (pair? l) (count (cdr l) (+ n 1)) n)) (count (let mk ((i 0) (l '())) (if (< i 3000) (mk (+ i 1) (cons i l)) l)) 0)", "3000");
+    rom_test(comp_vm, "CodeRom", "(define v (make-vector 50 0)) (let loop ((i 0)) (if (< i 50) (begin (vector-set! v i (* i i)) (loop (+ i 1))))) (vector-ref v 49)", "2401");
+    rom_test(comp_vm, "CodeRom", "(define (f) undefined-global) (f)", "RuntimeError: unbound variable: undefined-global");
 
     /* Unbalanced source: an error naming the line, never a hang (a stray ")" once made the
      * reader return empty symbols forever) */

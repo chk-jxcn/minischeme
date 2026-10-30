@@ -11,7 +11,8 @@
 ;;;   4. Bytecode Code Generator with Tail-Call Optimization (TCO)
 ;;;      - Inline arithmetic (API 1.14): (+ a b) (- a b) (* a b) and the two-argument
 ;;;        comparisons of the global procedures become OP_ADD .. OP_NUM_EQ
-;;;        (*inline-arith* #f: calls, for firmware before API 1.14)
+;;;      - API procedures by number (API 1.15): OP_CALL_PRIM; car cdr not null? pair? eq?
+;;;        vector-ref inline (*target-api*: what the target firmware runs)
 ;;;      - Immediate Integer Packing: OP_INT8 for -128..127
 ;;;   5. eval, eval-string, eval-file
 ;;; =========================================================================
@@ -51,11 +52,54 @@
 (define OP_LE 26)
 (define OP_GE 27)
 (define OP_NUM_EQ 28)
+;; API 1.15: API procedures called by number, a few inline
+(define OP_CALL_PRIM 29)
+(define OP_CAR 30)
+(define OP_CDR 31)
+(define OP_NOT 32)
+(define OP_NULLP 33)
+(define OP_PAIRP 34)
+(define OP_EQ 35)
+(define OP_VECTOR_REF 36)
 
-;; #f: no inline arithmetic, the images run on firmware before API 1.14 (compile_to_hex
-;; --no-inline-arith, a WebREPL target with an older firmware); kept when this file is
-;; loaded again
+;; The firmware API the code is for, major * 1000 + minor: which instructions it may use
+;; (1014: inline arithmetic; 1015: API procedures by number, inline car cdr not null? pair? eq?
+;; vector-ref). compile_to_hex --target-api, the WebREPL for an older board. Kept when this file
+;; is loaded again.
+(define *target-api* (if (%defined? '*target-api*) *target-api* 1015))
+
+;; #f: as *target-api* 1013 (the switch of API 1.14, still read)
 (define *inline-arith* (if (%defined? '*inline-arith*) *inline-arith* #t))
+
+(define (target-api) (if *inline-arith* *target-api* (min *target-api* 1013)))
+
+;; (name arity instruction): API 1.15
+(define inline-prim-ops
+  (list (list 'car 1 OP_CAR) (list 'cdr 1 OP_CDR) (list 'not 1 OP_NOT) (list 'null? 1 OP_NULLP)
+        (list 'pair? 1 OP_PAIRP) (list 'eq? 2 OP_EQ) (list 'vector-ref 2 OP_VECTOR_REF)))
+
+;; Names of API procedures the source being compiled defines or assigns itself (anywhere in it):
+;; those stay ordinary calls of the global, never instructions or numbers
+(define *own-globals* '())
+
+(define (own-globals exprs)
+  (define (scan x acc)
+    (cond ((not (pair? x)) acc)
+          ((and (memq (car x) '(define set!)) (pair? (cdr x)))
+           (let* ((t (cadr x)) (name (if (pair? t) (car t) t)))
+             (scan-list (cddr x) (if (and (symbol? name) (or (assq name inline-arith-ops) (%api-id name)))
+                                     (cons name acc)
+                                     acc))))
+          (else (scan-list x acc))))
+  (define (scan-list l acc)
+    (if (pair? l) (scan-list (cdr l) (scan (car l) acc)) acc))
+  (scan-list exprs '()))
+
+;; May (op ...) become an instruction of API need? The global procedure, not a local, not the
+;; source's own
+(define (inline-ok? ctx op need)
+  (and (>= (target-api) need) (symbol? op) (not (memq op *own-globals*))
+       (eq? (car (lookup-var ctx op)) 'global)))
 
 (define inline-arith-ops
   (list (cons '+ OP_ADD) (cons '- OP_SUB) (cons '* OP_MUL) (cons '< OP_LT) (cons '> OP_GT)
@@ -959,11 +1003,26 @@
 
          ;; (+ a b), (< a b) ...: an instruction when the name is the global procedure (not a
          ;; local or captured variable of that name)
-         ((and *inline-arith* (symbol? op) (assq op inline-arith-ops) (pair? args) (pair? (cdr args))
-               (null? (cddr args)) (eq? (car (lookup-var ctx op)) 'global))
+         ((and (symbol? op) (assq op inline-arith-ops) (pair? args) (pair? (cdr args))
+               (null? (cddr args)) (inline-ok? ctx op 1014))
           (compile-expr ctx (car args) #f)
           (compile-expr ctx (cadr args) #f)
           (emit-byte ctx (cdr (assq op inline-arith-ops)))
+          (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
+
+         ;; (car p), (eq? a b) ...: an instruction (API 1.15)
+         ((and (symbol? op) (assq op inline-prim-ops) (= (length args) (cadr (assq op inline-prim-ops)))
+               (inline-ok? ctx op 1015))
+          (for-each (lambda (arg) (compile-expr ctx arg #f)) args)
+          (emit-byte ctx (caddr (assq op inline-prim-ops)))
+          (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
+
+         ;; (f a ...) of an API procedure: by its permanent number (API 1.15)
+         ((and (symbol? op) (< (length args) 256) (inline-ok? ctx op 1015) (%api-id op))
+          (for-each (lambda (arg) (compile-expr ctx arg #f)) args)
+          (emit-byte ctx OP_CALL_PRIM)
+          (emit-u16 ctx (%api-id op))
+          (emit-byte ctx (length args))
           (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
          ;; General Procedure Call
@@ -1012,6 +1071,7 @@
     ((and (pair? expr) (eq? (car expr) 'define-syntax))
      (lambda () (eval expr)))
     (else
+     (set! *own-globals* (append (own-globals (list expr)) *own-globals*))   ; what this session defined
      (let* ((expanded (macro-expand expr))
             (optimized (optimize-ast expanded))
             (co (compile-to-code optimized)))
@@ -1071,6 +1131,7 @@
 
 (define (%compile-source-to-code str)
   (let ((exprs (read-from-string str)))
+    (set! *own-globals* (own-globals exprs))
     (if (null? exprs)
         #f
         (let loop ((rest exprs) (compiled '()))
