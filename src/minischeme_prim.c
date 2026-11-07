@@ -68,7 +68,7 @@ Value prim_vector_ref(MiniVM *vm, int argc, Value *argv) {
     return mini_vector_ref(vm, argv[0], (size_t)idx);
 }
 
-static Value prim_vector_set(MiniVM *vm, int argc, Value *argv) {
+Value prim_vector_set(MiniVM *vm, int argc, Value *argv) {
     if (argc != 3 || !mini_is_vector(argv[0]) || !mini_is_fixnum(argv[1])) {
         vm_error(vm, "vector-set!: expected vector, index, and value");
         return mini_void();

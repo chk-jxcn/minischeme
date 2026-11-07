@@ -61,12 +61,34 @@
 (define OP_PAIRP 34)
 (define OP_EQ 35)
 (define OP_VECTOR_REF 36)
+;; API 1.16: direct self-recursion, short-circuit jump, inline primitives & local superinstructions
+(define OP_CALL_SELF 37)
+(define OP_TAIL_CALL_SELF 38)
+(define OP_JUMP_IF_TRUE_KEEP 39)
+(define OP_CONS 40)
+(define OP_VECTOR_SET 41)
+(define OP_REM 42)
+(define OP_QUOT 43)
+(define OP_DIV 44)
+(define OP_GET_LOCAL2 45)
+(define OP_SET_LOCAL_POP 46)
+(define OP_ADD_LOC_IMM 47)
+(define OP_SUB_LOC_IMM 48)
+(define OP_ADD_LOC_LOC 49)
+(define OP_SUB_LOC_LOC 50)
+(define OP_MUL_LOC_LOC 51)
+(define OP_EQ_LOC_IMM 52)
+(define OP_LT_LOC_IMM 53)
+(define OP_GT_LOC_IMM 54)
+(define OP_EQ_LOC_LOC 55)
+(define OP_LT_LOC_LOC 56)
+(define OP_LE_LOC_LOC 57)
+(define OP_GT_LOC_LOC 58)
+(define OP_CAR_LOC 59)
+(define OP_CDR_LOC 60)
+(define OP_NULLP_LOC 61)
 
-;; The firmware API the code is for, major * 1000 + minor: which instructions it may use
-;; (1014: inline arithmetic; 1015: API procedures by number, inline car cdr not null? pair? eq?
-;; vector-ref). compile_to_hex --target-api, the WebREPL for an older board. Kept when this file
-;; is loaded again.
-(define *target-api* (if (%defined? '*target-api*) *target-api* 1015))
+(define *target-api* (if (%defined? '*target-api*) *target-api* 1016))
 
 ;; #f: as *target-api* 1013 (the switch of API 1.14, still read)
 (define *inline-arith* (if (%defined? '*inline-arith*) *inline-arith* #t))
@@ -78,9 +100,44 @@
   (list (list 'car 1 OP_CAR) (list 'cdr 1 OP_CDR) (list 'not 1 OP_NOT) (list 'null? 1 OP_NULLP)
         (list 'pair? 1 OP_PAIRP) (list 'eq? 2 OP_EQ) (list 'vector-ref 2 OP_VECTOR_REF)))
 
+(define inline-prim-ops-1016
+  (list (list 'cons 2 OP_CONS) (list 'vector-set! 3 OP_VECTOR_SET)
+        (list 'remainder 2 OP_REM) (list 'quotient 2 OP_QUOT) (list '/ 2 OP_DIV)))
+
 ;; Names of API procedures the source being compiled defines or assigns itself (anywhere in it):
 ;; those stay ordinary calls of the global, never instructions or numbers
 (define *own-globals* '())
+;; Names of globals mutated (set!) anywhere or defined more than once at top-level
+(define *mutated-globals* '())
+
+(define (mutated-globals exprs)
+  (define defs '())
+  (define muts '())
+  (define (add-mut! s)
+    (if (and (symbol? s) (not (memq s muts)))
+        (set! muts (cons s muts))))
+  (define (scan-sets x)
+    (cond ((not (pair? x)) #f)
+          ((eq? (car x) 'quote) #f)
+          ((and (eq? (car x) 'set!) (pair? (cdr x)))
+           (add-mut! (cadr x))
+           (scan-sets-list (cddr x)))
+          (else (scan-sets-list x))))
+  (define (scan-sets-list l)
+    (if (pair? l) (begin (scan-sets (car l)) (scan-sets-list (cdr l)))))
+  (define (scan-top x)
+    (cond ((not (pair? x)) #f)
+          ((eq? (car x) 'begin) (for-each scan-top (cdr x)))
+          ((and (eq? (car x) 'define) (pair? (cdr x)))
+           (let* ((t (cadr x)) (name (if (pair? t) (car t) t)))
+             (if (symbol? name)
+                 (if (memq name defs)
+                     (add-mut! name)
+                     (set! defs (cons name defs))))
+             (scan-sets-list (cddr x))))
+          (else (scan-sets x))))
+  (for-each scan-top exprs)
+  muts)
 
 (define (own-globals exprs)
   (define (scan x acc)
@@ -608,7 +665,7 @@
 
 (define (make-compiler-ctx parent fn-name)
   (list parent        ; 0: parent
-        fn-name       ; 1: fn-name
+        fn-name       ; 1: fn-name (symbol or #f for direct self-recursion)
         '()           ; 2: locals: list of (sym . slot)
         0             ; 3: num-locals
         0             ; 4: max-locals
@@ -616,7 +673,8 @@
         #f            ; 6: is-variadic
         (cons #f #f)  ; 7: has-inner-lambdas box (car)
         '()           ; 8: consts
-        '()))         ; 9: code (bytes in reverse)
+        '()           ; 9: code (bytes in reverse)
+        '()))         ; 10: loops: list of (name arity slots loop-pos)
 
 (define (ctx-parent ctx) (list-ref ctx 0))
 (define (ctx-fn-name ctx) (list-ref ctx 1))
@@ -636,6 +694,8 @@
 (define (set-ctx-consts! ctx v) (list-set! ctx 8 v))
 (define (ctx-code ctx) (list-ref ctx 9))
 (define (set-ctx-code! ctx v) (list-set! ctx 9 v))
+(define (ctx-loops ctx) (list-ref ctx 10))
+(define (set-ctx-loops! ctx v) (list-set! ctx 10 v))
 
 (define (emit-byte ctx b)
   (set-ctx-code! ctx (cons b (ctx-code ctx))))
@@ -666,12 +726,6 @@
         (set-ctx-max-locals! ctx (+ slot 1)))
     slot))
 
-;; A plain let inside a procedure binds fresh slots of the enclosing frame
-;; instead of calling an immediately-applied lambda: no closure, no extra
-;; call frame and, unless a real lambda captures something, no heap
-;; environment for the function. Slots are never reused, so a closure that
-;; captured one keeps seeing only its own binding. Loops are calls, so each
-;; iteration still gets a fresh frame.
 (define (alloc-slot! ctx)
   (let ((slot (ctx-num-locals ctx)))
     (set-ctx-num-locals! ctx (+ slot 1))
@@ -679,29 +733,213 @@
         (set-ctx-max-locals! ctx (+ slot 1)))
     slot))
 
+(define (has-define? b)
+  (and (pair? b)
+       (or (and (pair? (car b)) (memq (caar b) '(define define-syntax define-macro)))
+           (has-define? (cdr b)))))
+
 (define (let-slots-ok? ctx vars body)
-  (define (has-define? b)
-    (and (pair? b)
-         (or (and (pair? (car b)) (memq (caar b) '(define define-syntax define-macro)))
-             (has-define? (cdr b)))))
   (and (ctx-parent ctx)
        (pair? vars)
        (< (+ (ctx-num-locals ctx) (length vars)) 200)
        (not (has-define? body))))
 
+(define (proper-sym-list? p)
+  (cond ((null? p) #t)
+        ((pair? p) (and (symbol? (car p)) (proper-sym-list? (cdr p)) (not (memq (car p) (cdr p)))))
+        (else #f)))
+
+;; Static analysis for Named-let -> local slots + backward OP_JUMP loop transformation
+(define (body-has-closure-or-def? x)
+  (cond ((not (pair? x)) #f)
+        ((eq? (car x) 'quote) #f)
+        ((memq (car x) '(lambda define define-syntax define-macro)) #t)
+        (else (let loop ((l x))
+                (and (pair? l)
+                     (or (body-has-closure-or-def? (car l))
+                         (loop (cdr l))))))))
+
+(define (no-ref? x sym)
+  (cond
+    ((not (pair? x)) (not (eq? x sym)))
+    ((or (eq? (car x) 'quote) (eq? (car x) 'include-bytes)) #t)
+    ((and (eq? (car x) 'let) (pair? (cdr x)) (symbol? (cadr x)))
+     (let* ((n2 (cadr x))
+            (bs (caddr x))
+            (b  (cdddr x)))
+       (and (no-ref-list? (map cadr bs) sym)
+            (if (or (eq? n2 sym) (memq sym (map car bs)))
+                #t
+                (no-ref-list? b sym)))))
+    ((and (eq? (car x) 'let) (pair? (cdr x)))
+     (let ((bs (cadr x)) (b (cddr x)))
+       (and (no-ref-list? (map cadr bs) sym)
+            (if (memq sym (map car bs))
+                #t
+                (no-ref-list? b sym)))))
+    ((and (eq? (car x) 'let*) (pair? (cdr x)))
+     (let step ((bs (cadr x)))
+       (cond ((null? bs) (no-ref-list? (cddr x) sym))
+             ((not (no-ref? (cadr (car bs)) sym)) #f)
+             ((eq? (caar bs) sym) #t)
+             (else (step (cdr bs))))))
+    ((and (eq? (car x) 'letrec) (pair? (cdr x)))
+     (let ((bs (cadr x)) (b (cddr x)))
+       (if (memq sym (map car bs))
+           #t
+           (and (no-ref-list? (map cadr bs) sym) (no-ref-list? b sym)))))
+    (else (no-ref-list? x sym))))
+
+(define (no-ref-list? l sym)
+  (cond ((null? l) #t)
+        ((pair? l) (and (no-ref? (car l) sym) (no-ref-list? (cdr l) sym)))
+        (else (not (eq? l sym)))))
+
+(define (seq-tail-only? seq sym arity)
+  (cond ((null? seq) #t)
+        ((null? (cdr seq)) (tail-only-calls? (car seq) sym arity))
+        (else (and (no-ref? (car seq) sym) (seq-tail-only? (cdr seq) sym arity)))))
+
+(define (tail-only-calls? expr sym arity)
+  (cond
+    ((not (pair? expr)) (not (eq? expr sym)))
+    ((or (eq? (car expr) 'quote) (eq? (car expr) 'include-bytes)) #t)
+    ((eq? (car expr) 'if)
+     (let ((args (cdr expr)))
+       (and (no-ref? (car args) sym)
+            (tail-only-calls? (cadr args) sym arity)
+            (if (pair? (cddr args))
+                (tail-only-calls? (caddr args) sym arity)
+                #t))))
+    ((eq? (car expr) 'begin)
+     (seq-tail-only? (cdr expr) sym arity))
+    ((or (eq? (car expr) 'and) (eq? (car expr) 'or))
+     (seq-tail-only? (cdr expr) sym arity))
+    ((and (eq? (car expr) 'let) (pair? (cdr expr)) (symbol? (cadr expr)))
+     (let* ((n2 (cadr expr))
+            (bs (caddr expr))
+            (vars2 (map car bs))
+            (vals2 (map cadr bs))
+            (b2 (cdddr expr)))
+       (and (no-ref-list? vals2 sym)
+            (if (or (eq? n2 sym) (memq sym vars2))
+                #t
+                (and (proper-sym-list? vars2)
+                     (< (length vars2) 100)
+                     (seq-tail-only? b2 n2 (length vars2))
+                     (seq-tail-only? b2 sym arity))))))
+    ((and (eq? (car expr) 'let) (pair? (cdr expr)))
+     (let* ((bs (cadr expr))
+            (vars2 (map car bs))
+            (vals2 (map cadr bs))
+            (b2 (cddr expr)))
+       (and (proper-sym-list? vars2)
+            (< (length vars2) 100)
+            (no-ref-list? vals2 sym)
+            (if (memq sym vars2)
+                #t
+                (seq-tail-only? b2 sym arity)))))
+    ((and (eq? (car expr) 'let*) (pair? (cdr expr)))
+     (let step ((bs (cadr expr)))
+       (cond ((null? bs) (seq-tail-only? (cddr expr) sym arity))
+             ((not (no-ref? (cadr (car bs)) sym)) #f)
+             ((eq? (caar bs) sym) #t)
+             (else (step (cdr bs))))))
+    ((eq? (car expr) sym)
+     (let ((cargs (cdr expr)))
+       (and (= (length cargs) arity)
+            (no-ref-list? cargs sym))))
+    (else
+     (no-ref? expr sym))))
+
+(define (named-let-loop-ok? ctx name vars body)
+  (and (>= (target-api) 1016)
+       (ctx-parent ctx)
+       (proper-sym-list? vars)
+       (< (+ (ctx-num-locals ctx) (length vars)) 180)
+       (not (body-has-closure-or-def? body))
+       (seq-tail-only? body name (length vars))))
+
+(define (mutated-in-exprs? sym exprs)
+  (define defs 0)
+  (define mut #f)
+  (define (walk-list l)
+    (if (pair? l)
+        (begin (walk (car l)) (walk-list (cdr l)))))
+  (define (walk x)
+    (cond ((not (pair? x)) #f)
+          ((eq? (car x) 'quote) #f)
+          ((and (eq? (car x) 'set!) (pair? (cdr x)))
+           (if (eq? (cadr x) sym) (set! mut #t))
+           (walk-list (cddr x)))
+          (else (walk-list x))))
+  (for-each (lambda (e)
+              (if (and (pair? e) (eq? (car e) 'define) (pair? (cdr e)))
+                  (let* ((t (cadr e)) (n (if (pair? t) (car t) t)))
+                    (if (eq? n sym) (set! defs (+ defs 1)))))
+              (walk e))
+            exprs)
+  (or mut (> defs 1)))
+
+(define (int8-lit? e)
+  (and (exact? e) (integer? e) (>= e -128) (<= e 127)))
+
+(define (int8-byte n)
+  (if (< n 0) (+ 256 n) n))
+
+(define (local-slot-of ctx e)
+  (and (symbol? e)
+       (let ((p (assq e (ctx-locals ctx))))
+         (and p (cdr p)))))
+
+(define (compile-args ctx args)
+  (cond
+    ((null? args) #f)
+    ((and (>= (target-api) 1016)
+          (pair? (cdr args))
+          (local-slot-of ctx (car args))
+          (local-slot-of ctx (cadr args)))
+     (emit-byte ctx OP_GET_LOCAL2)
+     (emit-byte ctx (local-slot-of ctx (car args)))
+     (emit-byte ctx (local-slot-of ctx (cadr args)))
+     (compile-args ctx (cddr args)))
+    (else
+     (compile-expr ctx (car args) #f)
+     (compile-args ctx (cdr args)))))
+
+(define (emit-pop-slots ctx slots)
+  (for-each (lambda (slot)
+              (if (>= (target-api) 1016)
+                  (begin
+                    (emit-byte ctx OP_SET_LOCAL_POP)
+                    (emit-byte ctx slot))
+                  (begin
+                    (emit-byte ctx OP_SET_LOCAL)
+                    (emit-byte ctx slot)
+                    (emit-byte ctx OP_POP))))
+            (reverse slots)))
+
 (define (compile-let-slots ctx vars vals body is-tail)
-  ;; values are computed in the outer scope, then bound all at once
-  (for-each (lambda (v) (compile-expr ctx v #f)) vals)
+  (compile-args ctx vals)
   (let* ((saved (ctx-locals ctx))
          (slots (map (lambda (v) (alloc-slot! ctx)) vars)))
-    (for-each (lambda (slot)
-                (emit-byte ctx OP_SET_LOCAL)
-                (emit-byte ctx slot)
-                (emit-byte ctx OP_POP))
-              (reverse slots))
+    (emit-pop-slots ctx slots)
     (set-ctx-locals! ctx (append (map cons vars slots) saved))
     (compile-sequence ctx body is-tail)
     (set-ctx-locals! ctx saved)))
+
+(define (compile-named-let-loop ctx name vars vals body is-tail)
+  (compile-args ctx vals)
+  (let* ((saved-locals (ctx-locals ctx))
+         (saved-loops  (ctx-loops ctx))
+         (slots (map (lambda (v) (alloc-slot! ctx)) vars)))
+    (emit-pop-slots ctx slots)
+    (let ((loop-pos (length (ctx-code ctx))))
+      (set-ctx-locals! ctx (append (map cons vars slots) saved-locals))
+      (set-ctx-loops!  ctx (cons (list name (length vars) slots loop-pos) saved-loops))
+      (compile-sequence ctx body is-tail)
+      (set-ctx-locals! ctx saved-locals)
+      (set-ctx-loops!  ctx saved-loops))))
 
 (define (lookup-var ctx sym)
   (let ((local (assq sym (ctx-locals ctx))))
@@ -714,7 +952,6 @@
                 (let ((plocal (assq sym (ctx-locals p))))
                   (if plocal
                       (let ()
-                        ;; mark ancestors
                         (define (mark curr)
                           (set-ctx-has-inner-lambdas! curr #t)
                           (if (not (eq? curr p))
@@ -727,18 +964,15 @@
 (define (patch-jump! ctx pos)
   (let* ((code (ctx-code ctx))
          (total-len (length code))
-         ;; pos is the 0-based offset from start of code array where 2-byte operand begins
          (offset (- total-len (+ pos 2)))
          (off16 (if (< offset 0) (+ 65536 offset) offset))
          (b0 (modulo off16 256))
          (b1 (quotient off16 256))
-         ;; code is stored in reverse: index 0 is the last emitted byte
          (rev-idx0 (- total-len 1 pos))
          (rev-idx1 (- total-len 1 (+ pos 1))))
     (list-set! code rev-idx0 b0)
     (list-set! code rev-idx1 b1)))
 
-;; Helper: mutate list element
 (define (list-set! lst idx val)
   (define (iter l i)
     (if (= i 0)
@@ -746,13 +980,101 @@
         (iter (cdr l) (- i 1))))
   (iter lst idx))
 
+(define (compile-lambda ctx params body fn-name is-tail)
+  (let ((child (make-compiler-ctx ctx fn-name)))
+    (define (scan-params p p-idx)
+      (cond
+        ((null? p)
+         (set-ctx-num-params! child p-idx))
+        ((symbol? p)
+         (add-local! child p)
+         (set-ctx-num-params! child (+ p-idx 1))
+         (set-ctx-is-variadic! child #t))
+        ((pair? p)
+         (add-local! child (car p))
+         (scan-params (cdr p) (+ p-idx 1)))))
+    (scan-params params 0)
+    (define (scan-defines b)
+      (if (pair? b)
+          (let ((form (car b)))
+            (if (and (pair? form) (eq? (car form) 'define))
+                (let* ((target (cadr form))
+                       (sym (if (pair? target) (car target) target)))
+                  (add-local! child sym)))
+            (scan-defines (cdr b)))))
+    (scan-defines body)
+    (compile-sequence child body #t)
+    (let ((code (ctx-code child)))
+      (if (or (null? code) (not (= (car code) OP_RETURN)))
+          (emit-byte child OP_RETURN)))
+    (let* ((bytes (list->vector (reverse (ctx-code child))))
+           (consts (list->vector (ctx-consts child)))
+           (num-params (ctx-num-params child))
+           (max-stack (+ (ctx-max-locals child) 64))
+           (is-varargs (ctx-is-variadic child))
+           (has-inner (ctx-has-inner-lambdas child))
+           (co (%make-code bytes consts num-params max-stack is-varargs has-inner))
+           (idx (add-const ctx co)))
+      (emit-byte ctx OP_CLOSURE)
+      (emit-u16 ctx idx)
+      (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))))
+
+(define (compile-binary-arith ctx op a b is-tail)
+  (let ((sa (local-slot-of ctx a))
+        (sb (local-slot-of ctx b))
+        (api16 (>= (target-api) 1016)))
+    (cond
+      ((and api16 (eq? op '+) sa (int8-lit? b))
+       (emit-byte ctx OP_ADD_LOC_IMM) (emit-byte ctx sa) (emit-byte ctx (int8-byte b)))
+      ((and api16 (eq? op '+) (int8-lit? a) sb)
+       (emit-byte ctx OP_ADD_LOC_IMM) (emit-byte ctx sb) (emit-byte ctx (int8-byte a)))
+      ((and api16 (eq? op '+) sa sb)
+       (emit-byte ctx OP_ADD_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '-) sa (int8-lit? b))
+       (emit-byte ctx OP_SUB_LOC_IMM) (emit-byte ctx sa) (emit-byte ctx (int8-byte b)))
+      ((and api16 (eq? op '-) sa sb)
+       (emit-byte ctx OP_SUB_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '*) sa sb)
+       (emit-byte ctx OP_MUL_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '=) sa (int8-lit? b))
+       (emit-byte ctx OP_EQ_LOC_IMM) (emit-byte ctx sa) (emit-byte ctx (int8-byte b)))
+      ((and api16 (eq? op '=) (int8-lit? a) sb)
+       (emit-byte ctx OP_EQ_LOC_IMM) (emit-byte ctx sb) (emit-byte ctx (int8-byte a)))
+      ((and api16 (eq? op '=) sa sb)
+       (emit-byte ctx OP_EQ_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '<) sa (int8-lit? b))
+       (emit-byte ctx OP_LT_LOC_IMM) (emit-byte ctx sa) (emit-byte ctx (int8-byte b)))
+      ((and api16 (eq? op '<) (int8-lit? a) sb)
+       (emit-byte ctx OP_GT_LOC_IMM) (emit-byte ctx sb) (emit-byte ctx (int8-byte a)))
+      ((and api16 (eq? op '<) sa sb)
+       (emit-byte ctx OP_LT_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '>) sa (int8-lit? b))
+       (emit-byte ctx OP_GT_LOC_IMM) (emit-byte ctx sa) (emit-byte ctx (int8-byte b)))
+      ((and api16 (eq? op '>) (int8-lit? a) sb)
+       (emit-byte ctx OP_LT_LOC_IMM) (emit-byte ctx sb) (emit-byte ctx (int8-byte a)))
+      ((and api16 (eq? op '>) sa sb)
+       (emit-byte ctx OP_GT_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '<=) sa sb)
+       (emit-byte ctx OP_LE_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
+      ((and api16 (eq? op '>=) sa sb)
+       (emit-byte ctx OP_LE_LOC_LOC) (emit-byte ctx sb) (emit-byte ctx sa))
+      (else
+       (compile-args ctx (list a b))
+       (emit-byte ctx (cdr (assq op inline-arith-ops)))))
+    (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
+
+(define (fold-left-binop op first rest)
+  (if (null? rest)
+      first
+      (fold-left-binop op (list op first (car rest)) (cdr rest))))
+
 ;; Main compiler dispatch
 (define (compile-expr ctx expr is-tail)
   (cond
     ;; Constant / Literal: Small Integer (exact)
-    ((and (exact? expr) (integer? expr) (>= expr -128) (<= expr 127))
+    ((int8-lit? expr)
      (emit-byte ctx OP_INT8)
-     (emit-byte ctx (if (< expr 0) (+ 256 expr) expr))
+     (emit-byte ctx (int8-byte expr))
      (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
     ;; Constant / Literal: Boolean
@@ -801,13 +1123,18 @@
        (cond
          ;; (quote datum)
          ((eq? op 'quote)
-          (let ((idx (add-const ctx (car args))))
-            (emit-byte ctx OP_CONST)
-            (emit-u16 ctx idx)
-            (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
+          (let ((d (car args)))
+            (cond
+              ((null? d) (compile-expr ctx '() is-tail))
+              ((boolean? d) (compile-expr ctx d is-tail))
+              ((int8-lit? d) (compile-expr ctx d is-tail))
+              (else
+               (let ((idx (add-const ctx d)))
+                 (emit-byte ctx OP_CONST)
+                 (emit-u16 ctx idx)
+                 (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))))))
 
-         ;; (include-bytes "path"): the file's bytes as a string constant,
-         ;; read at compile time (fonts embedded into an app image)
+         ;; (include-bytes "path")
          ((eq? op 'include-bytes)
           (let ((data (%read-file-string (car args))))
             (if (not data) (error "include-bytes: cannot read file" (car args)))
@@ -816,22 +1143,34 @@
               (emit-u16 ctx idx)
               (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))))
 
-         ;; (if test then [else])
+         ;; (if test then [else]) with (if (not x) t e) -> (if x e t) & no dead jump in tail
          ((eq? op 'if)
           (let ((test-expr (car args))
                 (then-expr (cadr args))
                 (else-expr (if (pair? (cddr args)) (caddr args) (void))))
-            (compile-expr ctx test-expr #f)
-            (emit-byte ctx OP_JUMP_IF_FALSE)
-            (let ((jump-false-pos (length (ctx-code ctx))))
-              (emit-u16 ctx 0)
-              (compile-expr ctx then-expr is-tail)
-              (emit-byte ctx OP_JUMP)
-              (let ((jump-end-pos (length (ctx-code ctx))))
-                (emit-u16 ctx 0)
-                (patch-jump! ctx jump-false-pos)
-                (compile-expr ctx else-expr is-tail)
-                (patch-jump! ctx jump-end-pos)))))
+            (if (and (pair? test-expr)
+                     (eq? (car test-expr) 'not)
+                     (pair? (cdr test-expr))
+                     (null? (cddr test-expr))
+                     (inline-ok? ctx 'not 1015))
+                (compile-expr ctx (list 'if (cadr test-expr) else-expr then-expr) is-tail)
+                (begin
+                  (compile-expr ctx test-expr #f)
+                  (emit-byte ctx OP_JUMP_IF_FALSE)
+                  (let ((jump-false-pos (length (ctx-code ctx))))
+                    (emit-u16 ctx 0)
+                    (compile-expr ctx then-expr is-tail)
+                    (if (and is-tail (ctx-parent ctx))
+                        (begin
+                          (patch-jump! ctx jump-false-pos)
+                          (compile-expr ctx else-expr #t))
+                        (begin
+                          (emit-byte ctx OP_JUMP)
+                          (let ((jump-end-pos (length (ctx-code ctx))))
+                            (emit-u16 ctx 0)
+                            (patch-jump! ctx jump-false-pos)
+                            (compile-expr ctx else-expr is-tail)
+                            (patch-jump! ctx jump-end-pos)))))))))
 
          ;; (and e ...)
          ((eq? op 'and)
@@ -848,6 +1187,15 @@
           (cond
             ((null? args) (compile-expr ctx #f is-tail))
             ((null? (cdr args)) (compile-expr ctx (car args) is-tail))
+            ((>= (target-api) 1016)
+             (compile-expr ctx (car args) #f)
+             (emit-byte ctx OP_JUMP_IF_TRUE_KEEP)
+             (let ((jump-true-pos (length (ctx-code ctx))))
+               (emit-u16 ctx 0)
+               (compile-expr ctx (cons 'or (cdr args)) is-tail)
+               (patch-jump! ctx jump-true-pos)
+               (if (and is-tail (ctx-parent ctx))
+                   (emit-byte ctx OP_RETURN))))
             (else
              (let ((tmp (gensym "or")))
                (compile-expr ctx
@@ -863,21 +1211,36 @@
          ((eq? op 'define)
           (let* ((target (car args))
                  (sym (if (pair? target) (car target) target))
-                 (val (if (pair? target)
-                          (cons 'lambda (cons (cdr target) (cdr args)))
-                          (cadr args))))
-            (let ((local (assq sym (ctx-locals ctx))))
-              (if local
-                  (begin
-                    (compile-expr ctx val #f)
-                    (emit-byte ctx OP_SET_LOCAL)
-                    (emit-byte ctx (cdr local))
-                    (emit-byte ctx OP_POP)
-                    (emit-byte ctx OP_VOID))
-                  (let ((idx (add-const ctx sym)))
-                    (compile-expr ctx val #f)
-                    (emit-byte ctx OP_DEF_GLOBAL)
-                    (emit-u16 ctx idx))))
+                 (is-fn (pair? target))
+                 (fn-params (if is-fn (cdr target) #f))
+                 (fn-body (if is-fn (cdr args) #f))
+                 (val (if is-fn
+                          (cons 'lambda (cons fn-params fn-body))
+                          (cadr args)))
+                 (local (assq sym (ctx-locals ctx)))
+                 (can-self (and (>= (target-api) 1016)
+                                is-fn
+                                (proper-sym-list? fn-params)
+                                (not (mutated-in-exprs? sym fn-body))
+                                (if local
+                                    #t
+                                    (and (not (ctx-parent ctx))
+                                         (not (memq sym *mutated-globals*)))))))
+            (if local
+                (begin
+                  (if can-self
+                      (compile-lambda ctx fn-params fn-body sym #f)
+                      (compile-expr ctx val #f))
+                  (emit-byte ctx OP_SET_LOCAL)
+                  (emit-byte ctx (cdr local))
+                  (emit-byte ctx OP_POP)
+                  (emit-byte ctx OP_VOID))
+                (let ((idx (add-const ctx sym)))
+                  (if can-self
+                      (compile-lambda ctx fn-params fn-body sym #f)
+                      (compile-expr ctx val #f))
+                  (emit-byte ctx OP_DEF_GLOBAL)
+                  (emit-u16 ctx idx)))
             (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
 
          ;; (set! var val)
@@ -902,29 +1265,33 @@
             (emit-byte ctx OP_VOID)
             (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
 
-         ;; (let ((v e) ...) body ...) or (let name ((v e) ...) body ...)
+         ;; (let ...) or (let name ...)
          ((eq? op 'let)
           (if (symbol? (car args))
-              ;; Named let: (let name ((var val) ...) body ...)
               (let* ((name (car args))
                      (bindings (cadr args))
                      (body (cddr args))
                      (vars (map car bindings))
                      (vals (map cadr bindings)))
-                (compile-expr ctx
-                  (list 'letrec (list (list name (cons 'lambda (cons vars body))))
-                        (cons name vals))
-                  is-tail))
-              ;; Standard let: (let ((var val) ...) body ...)
+                (if (named-let-loop-ok? ctx name vars body)
+                    (compile-named-let-loop ctx name vars vals body is-tail)
+                    (compile-expr ctx
+                      (list 'letrec (list (list name (cons 'lambda (cons vars body))))
+                            (cons name vals))
+                      is-tail)))
               (let* ((bindings (car args))
                      (body (cdr args))
                      (vars (map car bindings))
                      (vals (map cadr bindings)))
-                (if (let-slots-ok? ctx vars body)
-                    (compile-let-slots ctx vars vals body is-tail)
-                    (compile-expr ctx
-                      (cons (cons 'lambda (cons vars body)) vals)
-                      is-tail)))))
+                (cond
+                  ((and (null? vars) (not (has-define? body)))
+                   (compile-sequence ctx body is-tail))
+                  ((let-slots-ok? ctx vars body)
+                   (compile-let-slots ctx vars vals body is-tail))
+                  (else
+                   (compile-expr ctx
+                     (cons (cons 'lambda (cons vars body)) vals)
+                     is-tail))))))
 
          ;; (let* ((v e) ...) body ...)
          ((eq? op 'let*)
@@ -950,76 +1317,86 @@
                         (make-set-list (cdr vs) (cdr es)))))
             (compile-expr ctx
               (cons 'let
-                (cons (map (lambda (v) (list v (list 'void))) vars)
+                (cons (map (lambda (v) (list v (void))) vars)
                   (append (make-set-list vars vals)
                           body)))
               is-tail)))
 
          ;; (lambda params body ...)
          ((eq? op 'lambda)
-          (let* ((params (car args))
-                 (body (cdr args))
-                 (child (make-compiler-ctx ctx #f)))
-            ;; Scan and bind parameters
-            (define (scan-params p p-idx)
-              (cond
-                ((null? p)
-                 (set-ctx-num-params! child p-idx))
-                ((symbol? p)
-                 (add-local! child p)
-                 (set-ctx-num-params! child (+ p-idx 1))
-                 (set-ctx-is-variadic! child #t))
-                ((pair? p)
-                 (add-local! child (car p))
-                 (scan-params (cdr p) (+ p-idx 1)))))
-            (scan-params params 0)
-            ;; Scan for internal defines
-            (define (scan-defines b)
-              (if (pair? b)
-                  (let ((form (car b)))
-                    (if (and (pair? form) (eq? (car form) 'define))
-                        (let* ((target (cadr form))
-                               (sym (if (pair? target) (car target) target)))
-                          (add-local! child sym)))
-                    (scan-defines (cdr b)))))
-            (scan-defines body)
-            ;; Compile body
-            (compile-sequence child body #t)
-            (let ((code (ctx-code child)))
-              (if (or (null? code) (not (= (car code) OP_RETURN)))
-                  (emit-byte child OP_RETURN)))
-            ;; Create CodeObj
-            (let* ((bytes (list->vector (reverse (ctx-code child))))
-                   (consts (list->vector (ctx-consts child)))
-                   (num-params (ctx-num-params child))
-                   (max-stack (+ (ctx-max-locals child) 64))
-                   (is-varargs (ctx-is-variadic child))
-                   (has-inner (ctx-has-inner-lambdas child))
-                   (co (%make-code bytes consts num-params max-stack is-varargs has-inner))
-                   (idx (add-const ctx co)))
-              (emit-byte ctx OP_CLOSURE)
-              (emit-u16 ctx idx)
-              (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))))
+          (compile-lambda ctx (car args) (cdr args) #f is-tail))
 
-         ;; (+ a b), (< a b) ...: an instruction when the name is the global procedure (not a
-         ;; local or captured variable of that name)
+         ;; In-place Named-let loop tail jump!
+         ((and (symbol? op)
+               (not (assq op (ctx-locals ctx)))
+               (assq op (ctx-loops ctx)))
+          (let* ((linfo (assq op (ctx-loops ctx)))
+                 (slots (caddr linfo))
+                 (loop-pos (cadddr linfo)))
+            (compile-args ctx args)
+            (emit-pop-slots ctx slots)
+            (emit-byte ctx OP_JUMP)
+            (let ((op-pos (length (ctx-code ctx))))
+              (emit-int16 ctx (- loop-pos (+ op-pos 2))))))
+
+         ;; Direct self-recursive call (API 1.16)
+         ((and (>= (target-api) 1016)
+               (symbol? op)
+               (ctx-fn-name ctx)
+               (eq? op (ctx-fn-name ctx))
+               (not (assq op (ctx-locals ctx)))
+               (not (ctx-is-variadic ctx))
+               (= (length args) (ctx-num-params ctx)))
+          (compile-args ctx args)
+          (let ((argc (length args)))
+            (if is-tail
+                (begin (emit-byte ctx OP_TAIL_CALL_SELF) (emit-byte ctx argc))
+                (begin (emit-byte ctx OP_CALL_SELF) (emit-byte ctx argc)))))
+
+         ;; Multi-arg (+ a b c ...), (- a b c ...), (* a b c ...) -> binary inline chain
+         ((and (symbol? op)
+               (memq op '(+ - *))
+               (pair? args) (pair? (cdr args)) (pair? (cddr args))
+               (inline-ok? ctx op 1014))
+          (compile-expr ctx (fold-left-binop op (list op (car args) (cadr args)) (cddr args)) is-tail))
+
+         ;; Binary arithmetic & comparisons (API 1.14 + API 1.16 local superinstructions)
          ((and (symbol? op) (assq op inline-arith-ops) (pair? args) (pair? (cdr args))
                (null? (cddr args)) (inline-ok? ctx op 1014))
-          (compile-expr ctx (car args) #f)
-          (compile-expr ctx (cadr args) #f)
-          (emit-byte ctx (cdr (assq op inline-arith-ops)))
+          (compile-binary-arith ctx op (car args) (cadr args) is-tail))
+
+         ;; API 1.16 specialized local car / cdr / null?
+         ((and (>= (target-api) 1016)
+               (symbol? op)
+               (memq op '(car cdr null?))
+               (pair? args) (null? (cdr args))
+               (local-slot-of ctx (car args))
+               (inline-ok? ctx op 1015))
+          (let ((s (local-slot-of ctx (car args))))
+            (emit-byte ctx (cond ((eq? op 'car) OP_CAR_LOC)
+                                 ((eq? op 'cdr) OP_CDR_LOC)
+                                 (else OP_NULLP_LOC)))
+            (emit-byte ctx s)
+            (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
+
+         ;; API 1.16 inline primitives: cons, vector-set!, remainder, quotient, /
+         ((and (symbol? op) (assq op inline-prim-ops-1016)
+               (= (length args) (cadr (assq op inline-prim-ops-1016)))
+               (inline-ok? ctx op 1016))
+          (compile-args ctx args)
+          (emit-byte ctx (caddr (assq op inline-prim-ops-1016)))
           (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
-         ;; (car p), (eq? a b) ...: an instruction (API 1.15)
+         ;; API 1.15 inline primitives: car, cdr, not, null?, pair?, eq?, vector-ref
          ((and (symbol? op) (assq op inline-prim-ops) (= (length args) (cadr (assq op inline-prim-ops)))
                (inline-ok? ctx op 1015))
-          (for-each (lambda (arg) (compile-expr ctx arg #f)) args)
+          (compile-args ctx args)
           (emit-byte ctx (caddr (assq op inline-prim-ops)))
           (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
-         ;; (f a ...) of an API procedure: by its permanent number (API 1.15)
+         ;; (f a ...) of an API procedure by permanent number (API 1.15)
          ((and (symbol? op) (< (length args) 256) (inline-ok? ctx op 1015) (%api-id op))
-          (for-each (lambda (arg) (compile-expr ctx arg #f)) args)
+          (compile-args ctx args)
           (emit-byte ctx OP_CALL_PRIM)
           (emit-u16 ctx (%api-id op))
           (emit-byte ctx (length args))
@@ -1028,7 +1405,7 @@
          ;; General Procedure Call
          (else
           (compile-expr ctx op #f)
-          (for-each (lambda (arg) (compile-expr ctx arg #f)) args)
+          (compile-args ctx args)
           (let ((argc (length args)))
             (if is-tail
                 (begin (emit-byte ctx OP_TAIL_CALL) (emit-byte ctx argc))
@@ -1071,14 +1448,13 @@
     ((and (pair? expr) (eq? (car expr) 'define-syntax))
      (lambda () (eval expr)))
     (else
-     (set! *own-globals* (append (own-globals (list expr)) *own-globals*))   ; what this session defined
+     (set! *own-globals* (append (own-globals (list expr)) *own-globals*))
      (let* ((expanded (macro-expand expr))
             (optimized (optimize-ast expanded))
             (co (compile-to-code optimized)))
        (%make-closure co '())))))
 
 (define (eval expr)
-  ;; Check for macro definitions first
   (cond
     ((and (pair? expr) (eq? (car expr) 'define-macro))
      (let* ((sig (cadr expr))
@@ -1111,17 +1487,19 @@
        (%execute (%make-closure co '()))))))
 
 (define (eval-string str)
-  (let loop ((es (read-from-string str)) (res (void)))
-    (if (null? es)
-        res
-        (let* ((e (car es))
-               (rest (cdr es))
-               (clo (compile-one e)))
-          (set! es #f)
-          (set! e #f)
-          (let ((val (clo)))
-            (set! clo #f)
-            (loop rest val))))))
+  (let ((all-es (read-from-string str)))
+    (set! *mutated-globals* (append (mutated-globals all-es) *mutated-globals*))
+    (let loop ((es all-es) (res (void)))
+      (if (null? es)
+          res
+          (let* ((e (car es))
+                 (rest (cdr es))
+                 (clo (compile-one e)))
+            (set! es #f)
+            (set! e #f)
+            (let ((val (clo)))
+              (set! clo #f)
+              (loop rest val)))))))
 
 (define (eval-file filepath)
   (let ((content (%read-file-string filepath)))
@@ -1132,6 +1510,7 @@
 (define (%compile-source-to-code str)
   (let ((exprs (read-from-string str)))
     (set! *own-globals* (own-globals exprs))
+    (set! *mutated-globals* (mutated-globals exprs))
     (if (null? exprs)
         #f
         (let loop ((rest exprs) (compiled '()))
@@ -1142,26 +1521,19 @@
                 (else (compile-to-code (cons 'begin (reverse compiled)))))
               (let ((e (car rest)))
                 (cond
-                  ;; Top-level begin: splice into rest
                   ((and (pair? e) (eq? (car e) 'begin))
                    (loop (append (cdr e) (cdr rest)) compiled))
 
-                  ;; Macro definition: evaluate immediately in compiler env, then emit its name
                   ((and (pair? e) (or (eq? (car e) 'define-syntax) (eq? (car e) 'define-macro)))
                    (let* ((sig (cadr e))
                           (name (if (pair? sig) (car sig) sig)))
                      (eval e)
                      (loop (cdr rest) (cons (list 'quote name) compiled))))
 
-                  ;; Regular expression: expand macro (if top-level macro call) or expand inner and optimize
                   (else
                    (let ((exp1 (macro-expand-1 e)))
                      (if (car exp1)
-                         ;; Top-level macro expanded: loop to handle possible begin or further macro expansion
                          (loop (cons (cdr exp1) (cdr rest)) compiled)
-                         ;; Not top-level macro: expand inner macros and optimize AST
                          (let* ((expanded (macro-expand e))
                                 (optimized (optimize-ast expanded)))
                            (loop (cdr rest) (cons optimized compiled)))))))))))))
-
-

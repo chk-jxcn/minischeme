@@ -74,30 +74,34 @@ int main(int argc, char **argv) {
     static char script[4096];
     if (compiler) {
         snprintf(script, sizeof(script),
+                 "(eval-file \"%s\")\n"
                  "(define comp-exprs (read-from-string (%%read-file-string \"%s\")))\n"
                  "(define init-exprs (read-from-string (%%read-file-string \"%s\")))\n"
-                 /* the compiler first (it defines %%compile-source-to-code), then init;
-                  * init's macro definitions are kept for eval at run time */
-                 "(define expanded-comp (map (lambda (e) (macro-expand e)) comp-exprs))\n"
+                 "(define all-raw (append comp-exprs init-exprs))\n"
+                 "(set! *own-globals* (own-globals all-raw))\n"
+                 "(set! *mutated-globals* (mutated-globals all-raw))\n"
+                 "(define expanded-comp (map (lambda (e) (optimize-ast (macro-expand e))) comp-exprs))\n"
                  "(define transformed-init\n"
                  "  (map (lambda (e)\n"
                  "         (if (and (pair? e) (or (eq? (car e) 'define-syntax) (eq? (car e) 'define-macro)))\n"
                  "             (list 'eval (list 'quote e))\n"
-                 "             e))\n"
+                 "             (optimize-ast (macro-expand e))))\n"
                  "       init-exprs))\n"
                  "(define *gen-code* (compile-to-code (cons 'begin (append expanded-comp transformed-init))))\n",
-                 comp_path, init_path);
+                 comp_path, comp_path, init_path);
     } else {
         snprintf(script, sizeof(script),
+                 "(eval-file \"%s\")\n"
                  "(load \"%s\")\n"
                  "(define init-exprs (read-from-string (%%read-file-string \"%s\")))\n"
-                 /* macros are expanded at compile time on the host */
+                 "(set! *own-globals* (own-globals init-exprs))\n"
+                 "(set! *mutated-globals* (mutated-globals init-exprs))\n"
                  "(define runtime-forms\n"
                  "  (filter (lambda (e)\n"
                  "            (not (and (pair? e) (or (eq? (car e) 'define-syntax) (eq? (car e) 'define-macro)))))\n"
                  "          init-exprs))\n"
                  "(define *gen-code* (compile-to-code (cons 'begin (map (lambda (e) (optimize-ast (macro-expand e))) runtime-forms))))\n",
-                 init_path, init_path);
+                 comp_path, init_path, init_path);
     }
 
     MiniVM *vm = mini_create(8 * 1024 * 1024);

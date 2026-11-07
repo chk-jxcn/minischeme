@@ -246,6 +246,33 @@ typedef enum {
     OP_PAIRP,
     OP_EQ,
     OP_VECTOR_REF,
+
+    /* API 1.16: self-recursion, short-circuit jump, inline primitives & local superinstructions */
+    OP_CALL_SELF,
+    OP_TAIL_CALL_SELF,
+    OP_JUMP_IF_TRUE_KEEP,
+    OP_CONS,
+    OP_VECTOR_SET,
+    OP_REM,
+    OP_QUOT,
+    OP_DIV,
+    OP_GET_LOCAL2,
+    OP_SET_LOCAL_POP,
+    OP_ADD_LOC_IMM,
+    OP_SUB_LOC_IMM,
+    OP_ADD_LOC_LOC,
+    OP_SUB_LOC_LOC,
+    OP_MUL_LOC_LOC,
+    OP_EQ_LOC_IMM,
+    OP_LT_LOC_IMM,
+    OP_GT_LOC_IMM,
+    OP_EQ_LOC_LOC,
+    OP_LT_LOC_LOC,
+    OP_LE_LOC_LOC,
+    OP_GT_LOC_LOC,
+    OP_CAR_LOC,
+    OP_CDR_LOC,
+    OP_NULLP_LOC,
     OP_COUNT
 } OpCode;
 
@@ -496,6 +523,7 @@ Value prim_callcc(MiniVM *vm, int argc, Value *argv);
 Value prim_car(MiniVM *vm, int argc, Value *argv);
 Value prim_cdr(MiniVM *vm, int argc, Value *argv);
 Value prim_vector_ref(MiniVM *vm, int argc, Value *argv);
+Value prim_vector_set(MiniVM *vm, int argc, Value *argv);
 /* (%api-id name): the API procedure's permanent number, or #f (the compiler's OP_CALL_PRIM) */
 Value prim_api_id(MiniVM *vm, int argc, Value *argv);
 
