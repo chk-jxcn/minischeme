@@ -1,8 +1,7 @@
 ;;; init.scm - Standard Scheme Library for MiniScheme
 ;;; Provides fundamental higher-order functions, list utilities, and macros.
 
-(define (list . args)
-  args)
+;; first-order list/char/eqv primitives provided by BUILTIN_CFUNCS in C
 
 (define (eqv? a b)
   (if (eq? a b)
@@ -28,26 +27,9 @@
 (define (cadddr x) (car (cdr (cdr (cdr x)))))
 
 ;; Calculate list length with tail recursion
-(define (length lst)
-  (define (iter l acc)
-    (if (null? l)
-        acc
-        (iter (cdr l) (+ acc 1))))
-  (iter lst 0))
+;; length & reverse provided by prim_length & prim_reverse in BUILTIN_CFUNCS
 
-;; Reverse a list with tail recursion
-(define (reverse lst)
-  (define (iter src dst)
-    (if (null? src)
-        dst
-        (iter (cdr src) (cons (car src) dst))))
-  (iter lst '()))
-
-;; Append two lists
-(define (append l1 l2)
-  (if (null? l1)
-      l2
-      (cons (car l1) (append (cdr l1) l2))))
+;; append provided by prim_append in BUILTIN_CFUNCS (iterative, variadic R7RS)
 
 ;; Higher-order: map (supports 1 or more lists)
 (define (map f lst . rest)
@@ -136,20 +118,7 @@
     ((unless test body ...)
      (if (not test) (begin body ...)))))
 
-(define-syntax and
-  (syntax-rules ()
-    ((and) #t)
-    ((and x) x)
-    ((and x y ...)
-     (if x (and y ...) #f))))
-
-(define-syntax or
-  (syntax-rules ()
-    ((or) #f)
-    ((or x) x)
-    ((or x y ...)
-     (let ((temp x))
-       (if temp temp (or y ...))))))
+;; and / or are compiled directly as special forms by compiler.scm
 
 (define-syntax cond
   (syntax-rules (else =>)

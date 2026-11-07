@@ -41,15 +41,29 @@ void *mini_word_alloc(size_t bytes) {
 }
 
 void mini_words_copy(void *dst, const void *src, size_t bytes) {
+#if defined(ESP_PLATFORM)
     /* volatile: the compiler must not turn the loop back into memcpy */
     volatile uint32_t *d = (volatile uint32_t *)dst;
     const volatile uint32_t *s = (const volatile uint32_t *)src;
     for (size_t i = 0; i < bytes / 4; i++) d[i] = s[i];
+#else
+    if (bytes > 0) memcpy(dst, src, bytes);
+#endif
 }
 
 void mini_words_fill(void *dst, uint32_t value, size_t bytes) {
+#if defined(ESP_PLATFORM)
     volatile uint32_t *d = (volatile uint32_t *)dst;
     for (size_t i = 0; i < bytes / 4; i++) d[i] = value;
+#else
+    if (bytes == 0) return;
+    if (value == 0) {
+        memset(dst, 0, bytes);
+    } else {
+        uint32_t *d = (uint32_t *)dst;
+        for (size_t i = 0; i < bytes / 4; i++) d[i] = value;
+    }
+#endif
 }
 
 void *mini_word_grow(void *old, size_t old_bytes, size_t new_bytes) {
@@ -449,6 +463,13 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
     vm->stat_major_gcs++;
     vm->gcache_gen++; /* objects move */
 
+    /* bench patch: clear the remembered set while its pointers are still valid */
+    for (size_t i = 0; i < vm->remset_count; i++) {
+        HeapObj *robj = (HeapObj *)UNTAG_PTR(vm->remset[i]);
+        if (robj) robj->type &= ~MINI_GC_REMSET_BIT;
+    }
+    vm->remset_count = 0;
+
     size_t tenured_used = (size_t)(vm->tenured_hp - vm->tenured_start);
     size_t eden_used = (size_t)(vm->eden_hp - vm->eden_start);
     size_t total_used = tenured_used + eden_used;
@@ -521,6 +542,12 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
         if (frame->closure) mark_val(vm, ((uintptr_t)frame->closure) | MINI_TAG_CLOSURE);
         if (frame->code)    mark_val(vm, ((uintptr_t)frame->code) | MINI_TAG_CODE);
         mark_val(vm, frame->env);
+    }
+
+    if (vm->gslots) {
+        for (uint32_t i = 0; i < vm->gslot_count; i++) {
+            if (vm->gslots[i]) mark_val(vm, vm->gslots[i]);
+        }
     }
 
     while (vm->mark_stack_count > 0) {
@@ -775,11 +802,7 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
     /* Reset Eden generation to empty */
     vm->eden_hp = vm->eden_start;
 
-    /* Clear Remembered Set */
-    for (size_t i = 0; i < vm->remset_count; i++) {
-        HeapObj *obj = (HeapObj *)UNTAG_PTR(vm->remset[i]);
-        if (obj) obj->type &= ~MINI_GC_REMSET_BIT;
-    }
+    /* Remembered Set: already cleared at the start of major_gc (bench patch) */
     vm->remset_count = 0;
 
     /* Legacy compatibility pointers */

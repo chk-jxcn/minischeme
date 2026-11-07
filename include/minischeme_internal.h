@@ -383,6 +383,7 @@ struct MiniVM {
     uint32_t gslot_count;
     /* OP_CALL_PRIM: the procedure of each API number, found at its first call (NULL until then) */
     MiniCFunc *prim_fns;
+    struct { uint32_t id1; uint32_t gen; Value binding; } prim_bcache[32];
 
     /* Runtime statistics (see mini_get_stats) */
     uint64_t stat_alloc_bytes;

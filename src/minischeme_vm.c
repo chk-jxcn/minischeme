@@ -723,20 +723,43 @@ vm_loop:
         }
         if (fn == prim_by_call) {
             /* the ordinary call of the global: its value below the arguments, as OP_CALL has it */
-            SYNC_VM_STATE();
+            uint32_t slot = (uint32_t)id & 31u;
             Value val = MINI_CONST_VOID;
-            const char *name;
-            for (size_t k = 0; mini_is_void(val) && !vm->has_error && (name = api_id_name(id, k)) != NULL; k++) {
-                Value sym = mini_make_symbol(vm, name);
-                val = env_lookup(vm, vm->global_env, sym);
-                if (mini_is_void(val)) val = global_miss(vm, sym);
-            }
-            RELOAD_VM_STATE();
-            if (vm->has_error) goto vm_err;
-            if (mini_is_void(val)) {
-                const char *hint = mini_api_unbound_hook ? mini_api_unbound_hook(mini_api_id_names[id]) : NULL;
-                vm_error(vm, "unbound variable: %s%s", mini_api_id_names[id], hint ? hint : "");
-                goto vm_err;
+            if (MINI_LIKELY(vm->prim_bcache[slot].id1 == (uint32_t)id + 1u &&
+                            vm->prim_bcache[slot].gen == vm->gcache_gen)) {
+                val = mini_cdr(vm->prim_bcache[slot].binding);
+            } else {
+                SYNC_VM_STATE();
+                const char *name;
+                for (size_t k = 0; mini_is_void(val) && !vm->has_error && (name = api_id_name(id, k)) != NULL; k++) {
+                    Value sym = find_symbol(vm, name);
+                    if (!sym) sym = mini_make_symbol(vm, name);
+                    Value b = global_binding(vm, sym);
+                    if (b) {
+                        vm->prim_bcache[slot].id1 = (uint32_t)id + 1u;
+                        vm->prim_bcache[slot].gen = vm->gcache_gen;
+                        vm->prim_bcache[slot].binding = b;
+                        val = mini_cdr(b);
+                        break;
+                    }
+                    val = global_miss(vm, sym);
+                    if (!mini_is_void(val)) {
+                        b = global_binding(vm, sym);
+                        if (b) {
+                            vm->prim_bcache[slot].id1 = (uint32_t)id + 1u;
+                            vm->prim_bcache[slot].gen = vm->gcache_gen;
+                            vm->prim_bcache[slot].binding = b;
+                        }
+                        break;
+                    }
+                }
+                RELOAD_VM_STATE();
+                if (vm->has_error) goto vm_err;
+                if (mini_is_void(val)) {
+                    const char *hint = mini_api_unbound_hook ? mini_api_unbound_hook(mini_api_id_names[id]) : NULL;
+                    vm_error(vm, "unbound variable: %s%s", mini_api_id_names[id], hint ? hint : "");
+                    goto vm_err;
+                }
             }
             for (int i = 0; i < call_argc; i++) sp[-i] = sp[-i - 1];
             sp[-call_argc] = val;

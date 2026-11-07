@@ -2,7 +2,7 @@ CC ?= gcc
 # WERROR= (empty) to build without -Werror; M32=-m32 for the 32-bit device profile
 WERROR ?= -Werror
 M32 ?=
-CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O2
+CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O3 -fno-crossjumping -fno-gcse
 CPPFLAGS += -Iinclude -Ibuild -D__USE_MINGW_ANSI_STDIO=1 -DMINISCHEME_EMBED_INIT
 ALL_CFLAGS = $(CFLAGS) $(WERROR) $(M32)
 LIBS ?= -lm

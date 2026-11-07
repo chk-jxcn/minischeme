@@ -1240,13 +1240,22 @@ static Value prim_append(MiniVM *vm, int argc, Value *argv) {
         cur = argv[i];
         while (mini_is_pair(cur)) {
             Value cell = mini_make_cons(vm, mini_car(cur), mini_nil());
-            if (mini_is_nil(head)) head = cell; else mini_set_cdr(tail, cell);
+            if (mini_is_nil(head)) {
+                head = cell;
+            } else {
+                mini_set_cdr(tail, cell);
+                mini_write_barrier(vm, tail, cell);
+            }
             tail = cell;
             cur = mini_cdr(cur);
         }
     }
-    if (mini_is_nil(head)) head = argv[argc - 1];
-    else mini_set_cdr(tail, argv[argc - 1]);
+    if (mini_is_nil(head)) {
+        head = argv[argc - 1];
+    } else {
+        mini_set_cdr(tail, argv[argc - 1]);
+        mini_write_barrier(vm, tail, argv[argc - 1]);
+    }
     mini_pop_root(vm);
     mini_pop_root(vm);
     mini_pop_root(vm);
