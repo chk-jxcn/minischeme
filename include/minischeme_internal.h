@@ -544,10 +544,17 @@ Value prim_number_p(MiniVM *vm, int argc, Value *argv);
 Value prim_min(MiniVM *vm, int argc, Value *argv);
 Value prim_max(MiniVM *vm, int argc, Value *argv);
 
+static inline double mini_flonum_val(Value v) {
+#ifdef MINI_HAS_IMM_FLONUM
+    if (MINI_LIKELY(mini_is_imm_flonum(v))) return mini_imm_flonum_to_double(v);
+#endif
+    return ((const FlonumObj *)UNTAG_PTR(v))->val;
+}
+
 /* Helper for double conversion */
 static inline double to_double_val(Value v) {
     if (mini_is_fixnum(v)) return (double)mini_to_fixnum(v);
-    if (mini_is_flonum(v)) return mini_to_flonum(v);
+    if (mini_is_flonum(v)) return mini_flonum_val(v);
     if (mini_is_bigint(v)) return bigint_to_double(v);
     return 0.0;
 }

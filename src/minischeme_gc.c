@@ -920,6 +920,20 @@ void mini_pop_root(MiniVM *vm) {
 /* ========================================================================= */
 
 Value mini_make_cons(MiniVM *vm, Value car, Value cdr) {
+    size_t aligned_sz = ALIGN8(sizeof(PairObj));
+    if (MINI_LIKELY(vm->eden_hp + aligned_sz <= vm->eden_limit)) {
+        PairObj *p = (PairObj *)vm->eden_hp;
+        vm->eden_hp += aligned_sz;
+        vm->stat_alloc_bytes += aligned_sz;
+#ifdef MINI_ALLOC_PROFILE
+        mini_prof_alloc(aligned_sz, OBJ_PAIR);
+#endif
+        p->header.type = OBJ_PAIR;
+        p->header.size = (uint32_t)aligned_sz;
+        p->car = car;
+        p->cdr = cdr;
+        return ((uintptr_t)p) | MINI_TAG_PAIR;
+    }
     mini_push_root(vm, &car);
     mini_push_root(vm, &cdr);
     PairObj *p = (PairObj *)gc_alloc(vm, sizeof(PairObj), OBJ_PAIR);
@@ -929,8 +943,10 @@ Value mini_make_cons(MiniVM *vm, Value car, Value cdr) {
     p->car = car;
     p->cdr = cdr;
     Value res = ((uintptr_t)p) | MINI_TAG_PAIR;
-    mini_write_barrier(vm, res, car);
-    mini_write_barrier(vm, res, cdr);
+    if (MINI_UNLIKELY((char *)p >= vm->tenured_start && (char *)p < vm->tenured_limit)) {
+        mini_write_barrier(vm, res, car);
+        mini_write_barrier(vm, res, cdr);
+    }
     return res;
 }
 
@@ -1051,6 +1067,10 @@ Value mini_make_string_len(MiniVM *vm, const char *str, size_t len) {
 }
 
 Value mini_make_flonum(MiniVM *vm, double num) {
+#ifdef MINI_HAS_IMM_FLONUM
+    Value imm;
+    if (MINI_LIKELY(mini_try_imm_flonum(num, &imm))) return imm;
+#endif
     FlonumObj *f = (FlonumObj *)gc_alloc(vm, sizeof(FlonumObj), OBJ_FLONUM);
     if (!f) return mini_void();
     f->val = num;
@@ -1058,7 +1078,10 @@ Value mini_make_flonum(MiniVM *vm, double num) {
 }
 
 double mini_to_flonum(Value v) {
-    if (mini_is_flonum(v)) {
+#ifdef MINI_HAS_IMM_FLONUM
+    if (MINI_LIKELY(mini_is_imm_flonum(v))) return mini_imm_flonum_to_double(v);
+#endif
+    if (mini_is_record(v) && (((MiniHeapObj *)(v & ~MINI_TAG_MASK))->type & MINI_OBJ_TYPE_MASK) == MINI_OBJ_FLONUM) {
         return ((FlonumObj *)UNTAG_PTR(v))->val;
     }
     return 0.0;
