@@ -1323,7 +1323,9 @@ static Value hof_map_each(MiniVM *vm, int argc, Value *argv, bool collect, const
         vm_error(vm, "%s: expected a procedure and 1-%d lists", who, HOF_MAX_LISTS);
         return mini_void();
     }
-    int nl = argc - 1;
+    /* the bound once more, as the loops see it: gcc 5 at -O3 unrolls them past it otherwise
+     * (a false -Warray-bounds) */
+    int nl = argc - 1 < HOF_MAX_LISTS ? argc - 1 : HOF_MAX_LISTS;
     Value cur[HOF_MAX_LISTS];
     Value head = mini_nil(), tail = mini_nil();
     for (int i = 0; i < nl; i++) cur[i] = argv[i + 1];
