@@ -13,6 +13,8 @@
 ;;;        comparisons of the global procedures become OP_ADD .. OP_NUM_EQ
 ;;;      - API procedures by number (API 1.15): OP_CALL_PRIM; car cdr not null? pair? eq?
 ;;;        vector-ref inline (*target-api*: what the target firmware runs)
+;;;      - API 1.17: OP_LOOP (named-let jumps), operations with a local second operand,
+;;;        (if (and ...) ...) without the intermediate boolean
 ;;;      - Immediate Integer Packing: OP_INT8 for -128..127
 ;;;   5. eval, eval-string, eval-file
 ;;; =========================================================================
@@ -87,8 +89,20 @@
 (define OP_CAR_LOC 59)
 (define OP_CDR_LOC 60)
 (define OP_NULLP_LOC 61)
+;; API 1.17: one instruction for the jump of a named-let loop with its new values; operations
+;; on the top of the stack and a local
+(define OP_LOOP 62)
+(define OP_ADD_L 63)
+(define OP_SUB_L 64)
+(define OP_MUL_L 65)
+(define OP_LT_L 66)
+(define OP_LE_L 67)
+(define OP_GT_L 68)
+(define OP_GE_L 69)
+(define OP_NUM_EQ_L 70)
+(define OP_VECTOR_REF_L 71)
 
-(define *target-api* (if (%defined? '*target-api*) *target-api* 1016))
+(define *target-api* (if (%defined? '*target-api*) *target-api* 1017))
 
 ;; #f: as *target-api* 1013 (the switch of API 1.14, still read)
 (define *inline-arith* (if (%defined? '*inline-arith*) *inline-arith* #t))
@@ -157,6 +171,11 @@
 (define (inline-ok? ctx op need)
   (and (>= (target-api) need) (symbol? op) (not (memq op *own-globals*))
        (eq? (car (lookup-var ctx op)) 'global)))
+
+;; (op . instruction) with a local second operand: API 1.17
+(define local-arith-ops-1017
+  (list (cons '+ OP_ADD_L) (cons '- OP_SUB_L) (cons '* OP_MUL_L) (cons '< OP_LT_L) (cons '<= OP_LE_L)
+        (cons '> OP_GT_L) (cons '>= OP_GE_L) (cons '= OP_NUM_EQ_L)))
 
 (define inline-arith-ops
   (list (cons '+ OP_ADD) (cons '- OP_SUB) (cons '* OP_MUL) (cons '< OP_LT) (cons '> OP_GT)
@@ -907,6 +926,19 @@
      (compile-expr ctx (car args) #f)
      (compile-args ctx (cdr args)))))
 
+;; The jump back to a named-let loop at loop-pos after its new values were pushed
+(define (emit-loop-jump ctx slots loop-pos)
+  (if (and (>= (target-api) 1017) (pair? slots))
+      (begin
+        (emit-byte ctx OP_LOOP)
+        (emit-byte ctx (length slots))
+        (for-each (lambda (slot) (emit-byte ctx slot)) (reverse slots)))
+      (begin
+        (emit-pop-slots ctx slots)
+        (emit-byte ctx OP_JUMP)))
+  (let ((op-pos (length (ctx-code ctx))))
+    (emit-int16 ctx (- loop-pos (+ op-pos 2)))))
+
 (define (emit-pop-slots ctx slots)
   (for-each (lambda (slot)
               (if (>= (target-api) 1016)
@@ -1058,10 +1090,31 @@
        (emit-byte ctx OP_LE_LOC_LOC) (emit-byte ctx sa) (emit-byte ctx sb))
       ((and api16 (eq? op '>=) sa sb)
        (emit-byte ctx OP_LE_LOC_LOC) (emit-byte ctx sb) (emit-byte ctx sa))
+      ((and sb (>= (target-api) 1017))
+       (compile-expr ctx a #f)
+       (emit-byte ctx (cdr (assq op local-arith-ops-1017)))
+       (emit-byte ctx sb))
       (else
        (compile-args ctx (list a b))
        (emit-byte ctx (cdr (assq op inline-arith-ops)))))
     (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN))))
+
+;; The test of an if: code that falls through when it holds and jumps when it does not; the
+;; positions of those jumps (to be patched to the else branch). API 1.17: each part of
+;; (and a b ...) jumps itself, no #f made and tested again.
+(define (compile-test ctx test)
+  (if (and (>= (target-api) 1017) (pair? test) (eq? (car test) 'and)
+           (pair? (cdr test)) (list? (cdr test)))
+      (let loop ((parts (cdr test)) (jumps '()))
+        (if (null? parts)
+            jumps
+            (loop (cdr parts) (append (compile-test ctx (car parts)) jumps))))
+      (begin
+        (compile-expr ctx test #f)
+        (emit-byte ctx OP_JUMP_IF_FALSE)
+        (let ((pos (length (ctx-code ctx))))
+          (emit-u16 ctx 0)
+          (list pos)))))
 
 (define (fold-left-binop op first rest)
   (if (null? rest)
@@ -1154,23 +1207,19 @@
                      (null? (cddr test-expr))
                      (inline-ok? ctx 'not 1015))
                 (compile-expr ctx (list 'if (cadr test-expr) else-expr then-expr) is-tail)
-                (begin
-                  (compile-expr ctx test-expr #f)
-                  (emit-byte ctx OP_JUMP_IF_FALSE)
-                  (let ((jump-false-pos (length (ctx-code ctx))))
-                    (emit-u16 ctx 0)
-                    (compile-expr ctx then-expr is-tail)
-                    (if (and is-tail (ctx-parent ctx))
-                        (begin
-                          (patch-jump! ctx jump-false-pos)
-                          (compile-expr ctx else-expr #t))
-                        (begin
-                          (emit-byte ctx OP_JUMP)
-                          (let ((jump-end-pos (length (ctx-code ctx))))
-                            (emit-u16 ctx 0)
-                            (patch-jump! ctx jump-false-pos)
-                            (compile-expr ctx else-expr is-tail)
-                            (patch-jump! ctx jump-end-pos)))))))))
+                (let ((jumps (compile-test ctx test-expr)))
+                  (compile-expr ctx then-expr is-tail)
+                  (if (and is-tail (ctx-parent ctx))
+                      (begin
+                        (for-each (lambda (pos) (patch-jump! ctx pos)) jumps)
+                        (compile-expr ctx else-expr #t))
+                      (begin
+                        (emit-byte ctx OP_JUMP)
+                        (let ((jump-end-pos (length (ctx-code ctx))))
+                          (emit-u16 ctx 0)
+                          (for-each (lambda (pos) (patch-jump! ctx pos)) jumps)
+                          (compile-expr ctx else-expr is-tail)
+                          (patch-jump! ctx jump-end-pos))))))))
 
          ;; (and e ...)
          ((eq? op 'and)
@@ -1334,10 +1383,7 @@
                  (slots (caddr linfo))
                  (loop-pos (cadddr linfo)))
             (compile-args ctx args)
-            (emit-pop-slots ctx slots)
-            (emit-byte ctx OP_JUMP)
-            (let ((op-pos (length (ctx-code ctx))))
-              (emit-int16 ctx (- loop-pos (+ op-pos 2))))))
+            (emit-loop-jump ctx slots loop-pos)))
 
          ;; Direct self-recursive call (API 1.16)
          ((and (>= (target-api) 1016)
@@ -1385,6 +1431,17 @@
                (inline-ok? ctx op 1016))
           (compile-args ctx args)
           (emit-byte ctx (caddr (assq op inline-prim-ops-1016)))
+          (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
+
+         ;; API 1.17 (vector-ref v k) of a local k
+         ((and (>= (target-api) 1017)
+               (eq? op 'vector-ref)
+               (pair? args) (pair? (cdr args)) (null? (cddr args))
+               (local-slot-of ctx (cadr args))
+               (inline-ok? ctx op 1015))
+          (compile-expr ctx (car args) #f)
+          (emit-byte ctx OP_VECTOR_REF_L)
+          (emit-byte ctx (local-slot-of ctx (cadr args)))
           (if (and is-tail (ctx-parent ctx)) (emit-byte ctx OP_RETURN)))
 
          ;; API 1.15 inline primitives: car, cdr, not, null?, pair?, eq?, vector-ref

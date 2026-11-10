@@ -169,6 +169,8 @@ static void rom_test(MiniVM *comp_vm, const char *cat, const char *src, const ch
 static bool code_ends_with(MiniVM *comp_vm, int api, const char *src, const uint8_t *tail, size_t n) {
     Value flag = mini_make_symbol(comp_vm, "*target-api*");
     mini_push_root(comp_vm, &flag);
+    Value before = env_lookup(comp_vm, comp_vm->global_env, flag);
+    mini_push_root(comp_vm, &before);
     env_define(comp_vm, comp_vm->global_env, flag, mini_make_fixnum(api));
     Value s = mini_make_string(comp_vm, src);
     Value code = mini_call(comp_vm, env_lookup_name(comp_vm, "%compile-source-to-code"), 1, &s);
@@ -178,7 +180,8 @@ static bool code_ends_with(MiniVM *comp_vm, int api, const char *src, const uint
         uint32_t len = ((CodeObj *)UNTAG_PTR(code))->code_len;
         ok = len >= n && memcmp(b + len - n, tail, n) == 0;
     }
-    env_define(comp_vm, comp_vm->global_env, flag, mini_make_fixnum(1015));
+    env_define(comp_vm, comp_vm->global_env, flag, before);
+    mini_pop_root(comp_vm);
     mini_pop_root(comp_vm);
     mini_clear_error(comp_vm);
     return ok;
@@ -648,6 +651,40 @@ int main(void) {
         check_result("TargetApi", "(list x) for 1.13: a call", code_ends_with(comp_vm, 1013, "(list x)", car_call, 3) ? "yes" : "no", "yes");
     }
 
+    /* API 1.17: OP_LOOP, operations with a local second operand, vector-ref with a local index,
+     * (if (and ...)) without the boolean, captured frames as vectors */
+    printf("\n--- API 1.17 instructions, captured frames ---\n");
+    eval_test(comp_vm, exec_vm, "NumberToString",
+              "(list (number->string 0) (number->string 7) (number->string -45) (number->string 255 16) (number->string -255 16) (number->string 8 8) (number->string 5 2) (number->string -5 2) (number->string 1152921504606846975) (number->string -1152921504606846976) (number->string 1152921504606846976) (number->string 2.5))",
+              "(\"0\" \"7\" \"-45\" \"ff\" \"-ff\" \"10\" \"101\" \"-101\" \"1152921504606846975\" \"-1152921504606846976\" \"1152921504606846976\" \"2.5\")");
+    eval_test(comp_vm, exec_vm, "Api117", "(let loop ((a 1) (b 2) (c 3) (n 5)) (if (= n 0) (list a b c) (loop b c a (- n 1))))", "(3 1 2)");
+    eval_test(comp_vm, exec_vm, "Api117",
+              "(define (f n) (define k 10) (define (g x) (+ x k)) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (g i)))))) (f 5)", "60");
+    eval_test(comp_vm, exec_vm, "Api117",
+              "(define (f a b) (let ((x (car (list a)))) (list (+ (* x 2) b) (- (* x 1) b) (* (car (list x)) b) (< (car (list x)) b) (<= (car (list x)) b) (> (car (list x)) b) (>= (car (list x)) b) (= (car (list x)) b)))) (list (f 3 4) (f 4 4) (f 1.5 2.5) (f 2 2.0))",
+              "((10 -1 12 #t #t #f #f #f) (12 0 16 #f #t #f #t #t) (5.5 -1 3.75 #t #t #f #f #f) (6 0 4 #f #t #f #t #t))");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f a b) (+ (car (list a)) b)) (f 1152921504606846976 1152921504606846976)", "2305843009213693952");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f a b) (< (car (list a)) b)) (f 'x 1)", "RuntimeError: <: expected numbers");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f a b) (* (car (list a)) b)) (f 2 \"x\")", "RuntimeError: *: expected number");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f v i) (vector-ref (car (list v)) i)) (list (f (vector 1 2 3) 2) (f (vector 'a) 0))", "(3 a)");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f v i) (vector-ref (car (list v)) i)) (f (vector 1) 5)", "RuntimeError: vector-ref: index 5 out of bounds (length 1)");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f v i) (vector-ref (car (list v)) i)) (f (list 1) 0)", "RuntimeError: vector-ref: expected vector and fixnum index");
+    mini_clear_error(exec_vm);
+    eval_test(comp_vm, exec_vm, "Api117",
+              "(define (f a b) (if (and (> a 0) (< b 10) (not (= a b))) 'yes 'no)) (list (f 1 2) (f 0 2) (f 1 20) (f 3 3))", "(yes no no no)");
+    eval_test(comp_vm, exec_vm, "Api117",
+              "(define (g a) (list (if (and (pair? a) (car a)) 'ok 'nope) (if (and) 1 2) (if (and a) 3 4))) (list (g '(1)) (g '(#f)) (g #f))",
+              "((ok 1 3) (nope 1 3) (nope 1 4))");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (counter) (define n 0) (lambda () (set! n (+ n 1)) n)) (define c (counter)) (c) (c) (c)", "3");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f x) (lambda (y) (lambda (z) (list x y z)))) (((f 1) 2) 3)", "(1 2 3)");
+    eval_test(comp_vm, exec_vm, "Api117", "(define (f) (define x 1) (define (inc!) (set! x (+ x 10))) (inc!) (inc!) x) (f)", "21");
+    eval_test(comp_vm, exec_vm, "Api117",
+              "(define (f) (define a 1) (define b 2) (define c 3) (define d 4) (define e 5) (define g 6) (define h 7) (define i 8) (define j 9) (define k 10) (lambda () (set! k (+ k a)) (list a j k))) (define h (f)) (h) (h)",
+              "(1 9 12)");
+
     /* From a Code ROM: global slots (defined, set!, redefined, looked up before definition),
      * GCs every 4 KB moving the bindings, the self tail call, branches on comparisons */
     printf("\n--- From a Code ROM (global slots) ---\n");
@@ -660,6 +697,12 @@ int main(void) {
     rom_test(comp_vm, "CodeRom", "(define (count l n) (if (pair? l) (count (cdr l) (+ n 1)) n)) (count (let mk ((i 0) (l '())) (if (< i 3000) (mk (+ i 1) (cons i l)) l)) 0)", "3000");
     rom_test(comp_vm, "CodeRom", "(define v (make-vector 50 0)) (let loop ((i 0)) (if (< i 50) (begin (vector-set! v i (* i i)) (loop (+ i 1))))) (vector-ref v 49)", "2401");
     rom_test(comp_vm, "CodeRom", "(define (f) undefined-global) (f)", "RuntimeError: unbound variable: undefined-global");
+    rom_test(comp_vm, "CodeRom",
+             "(define (f n) (define v (make-vector n 0)) (define (fill! i) (if (< i n) (begin (vector-set! v i (* i i)) (fill! (+ i 1))))) (define (sum i acc) (if (< i n) (sum (+ i 1) (+ acc (vector-ref v i))) acc)) (fill! 0) (list (sum 0 0) (let loop ((i 0) (l '())) (if (< i 3000) (loop (+ i 1) (cons (vector-ref v (remainder i n)) l)) (length l))))) (f 2000)",
+             "(2664667000 3000)");
+    rom_test(comp_vm, "CodeRom",
+             "(define (mandel size maxit) (let rows ((y 0) (count 0)) (if (= y size) count (let ((ci (- (/ (* 2.0 y) size) 1.0))) (let cols ((x 0) (count count)) (if (= x size) (rows (+ y 1) count) (let ((cr (- (/ (* 2.0 x) size) 1.5))) (let iter ((zr 0.0) (zi 0.0) (i 0)) (if (and (< i maxit) (<= (+ (* zr zr) (* zi zi)) 4.0)) (iter (+ (- (* zr zr) (* zi zi)) cr) (+ (* 2.0 zr zi) ci) (+ i 1)) (cols (+ x 1) (if (= i maxit) (+ count 1) count))))))))))) (mandel 30 50)",
+             "349");
 
     /* Unbalanced source: an error naming the line, never a hang (a stray ")" once made the
      * reader return empty symbols forever) */
