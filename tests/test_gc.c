@@ -360,6 +360,45 @@ static void test_wide_structures(void) {
     mini_destroy(vm);
 }
 
+/* 10. The collector pause: by hand, cut short by a full heap, and timed */
+static void test_pause(void) {
+    printf("\n--- 10. Collector pause ---\n");
+    MiniVM *vm = make_vm(1024 * 1024, 4096);
+    run(vm, PRELUDE);
+    bool ok = run_int(vm, "(begin (define keep (iota-list 2000)) (define box (make-vector 8 0)) 1)") == 1;
+    MiniStats s0 = stats(vm);
+    ok = ok && run_int(vm, "(if (gc-pause) 1 0)") == 1;
+    ok = ok && run_int(vm,
+        "(begin (define l2 (iota-list 5000)) (churn 300)"
+        " (vector-set! box 0 (iota-list 100)) (set-car! keep (make-vector 10 7))"
+        " (+ (sum-list l2) (sum-list (vector-ref box 0)) (vector-ref (car keep) 9) (sum-list (cdr keep))))") ==
+        4999LL * 5000 / 2 + 99LL * 100 / 2 + 7 + (1999LL * 2000 / 2 - 1999);
+    MiniStats s1 = stats(vm);
+    ok = ok && run_int(vm, "(if (gc-paused?) 1 0)") == 1 && run_int(vm, "(if (gc-resume) 1 0)") == 1 &&
+         run_int(vm, "(if (or (gc-paused?) (gc-resume)) 1 0)") == 0;
+    char note[120];
+    snprintf(note, sizeof(note), "%u minor, %u major collections while paused",
+             (unsigned)(s1.minor_gcs - s0.minor_gcs), (unsigned)(s1.major_gcs - s0.major_gcs));
+    check("no collection during a pause (one minor to start it)",
+          ok && s1.minor_gcs - s0.minor_gcs == 1 && s1.major_gcs == s0.major_gcs, note);
+    ok = run_int(vm, "(begin (churn 20000) (+ (sum-list l2) (sum-list (vector-ref box 0)) (vector-ref (car keep) 9)))") ==
+         4999LL * 5000 / 2 + 99LL * 100 / 2 + 7;
+    MiniStats s2 = stats(vm);
+    check("normal collections after the resume", ok && s2.minor_gcs > s1.minor_gcs, "");
+
+    /* 8 MB of garbage on a 1 MB heap: the pause gives way instead of running out of memory */
+    ok = run_int(vm, "(begin (gc-pause) (churn 20000) (if (gc-paused?) 0 (sum-list l2)))") == 4999LL * 5000 / 2;
+    check("a full heap ends the pause", ok && !vm->has_error, "");
+
+    /* timed: a loop that allocates nothing waits for the pause to run out */
+    long long spins = run_int(vm, "(if (gc-pause 20) (let f ((i 0)) (if (and (gc-paused?) (< i 100000000)) (f (+ i 1)) i)) -1)");
+    snprintf(note, sizeof(note), "%lld loop turns", spins);
+    check("a timed pause ends by itself", spins > 0 && spins < 100000000, note);
+    ok = run_int(vm, "(begin (gc-pause 100000) (churn 20000) (gc-resume) (churn 2000) (sum-list l2))") == 4999LL * 5000 / 2;
+    check("live data intact after pauses and collections", ok, "");
+    mini_destroy(vm);
+}
+
 int main(void) {
     printf("========================================================================\n");
     printf("  MiniScheme collector suite (%u-bit values, old generation: %s)\n", (unsigned)(sizeof(Value) * 8),
@@ -392,6 +431,7 @@ int main(void) {
     test_growing_heap();
     test_wide_structures();
     test_medium_holes();
+    test_pause();
 
     mini_destroy(g_comp);
     printf("\n========================================================================\n");
