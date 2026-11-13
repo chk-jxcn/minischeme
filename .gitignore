@@ -19,3 +19,4 @@ scratch/
 .idea/
 .DS_Store
 Thumbs.db
+build_ms/

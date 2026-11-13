@@ -6,11 +6,14 @@ M32 ?=
 # clang does not know these flags
 GCC_DISPATCH := $(if $(findstring clang,$(shell $(CC) --version 2>/dev/null)),,-fno-crossjumping -fno-gcse)
 CFLAGS ?= -std=c99 -Wall -Wextra -pedantic -Wno-unused-parameter -O3 $(GCC_DISPATCH)
-CPPFLAGS += -Iinclude -Ibuild -D__USE_MINGW_ANSI_STDIO=1 -DMINISCHEME_EMBED_INIT
+CPPFLAGS += -Iinclude -I$(BUILD) -D__USE_MINGW_ANSI_STDIO=1 -DMINISCHEME_EMBED_INIT
 ALL_CFLAGS = $(CFLAGS) $(WERROR) $(M32)
 LIBS ?= -lm
 
-BUILD = build
+# GCMS=1: the mark-sweep old generation (large heaps), built into its own directory
+GCMS ?=
+BUILD = $(if $(GCMS),build_ms,build)
+CPPFLAGS += $(if $(GCMS),-DMINI_GC_MARKSWEEP=1,) $(EXTRA)
 SRCS = src/minischeme.c src/minischeme_vm.c src/minischeme_gc.c src/minischeme_prim.c \
        src/minischeme_bigint.c src/minischeme_math.c src/minischeme_fasl.c \
        src/minischeme_cfasl.c src/minischeme_lib.c src/minischeme_help.c src/minischeme_stubs.c
@@ -68,4 +71,4 @@ test: minischeme $(TESTS)
 check: test
 
 clean:
-	rm -rf $(BUILD) minischeme minischeme.exe libminischeme.a src/*.o
+	rm -rf build build_ms minischeme minischeme.exe libminischeme.a src/*.o

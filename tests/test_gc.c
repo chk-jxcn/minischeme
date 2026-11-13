@@ -63,6 +63,7 @@ static long long run_int(MiniVM *vm, const char *src) {
 static MiniVM *make_vm(size_t heap, size_t eden) {
     MiniConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
+    heap = heap * (sizeof(Value) / 4);       /* the same number of objects with 8-byte values */
     cfg.initial_heap_bytes = heap;
     cfg.max_heap_bytes = heap;
     cfg.eden_bytes = eden;
@@ -105,11 +106,11 @@ static void test_full_heap_churn(void) {
     MiniVM *vm = make_vm(heap, 4096);
     run(vm, PRELUDE);
     /* 1500 vectors of 500 slots: about 3.05 MB with 4-byte values */
-    size_t slot = sizeof(Value);
+    /* slot counts as for 4-byte values: make_vm scales the heap with the value size */
     size_t per = (size_t)(heap * 0.76 / 1500);
     char src[256];
     snprintf(src, sizeof(src), "(begin (define big (make-vector 1500 0)) (fill-vectors! big %u) 1)",
-             (unsigned)((per - 8) / slot));
+             (unsigned)((per - 8) / 4));
     bool ok = run_int(vm, src) == 1;
     MiniStats s0 = stats(vm);
     ok = ok && run_int(vm, "(begin (churn 40000) (sum-first big))") == 1499LL * 1500 / 2;
@@ -130,11 +131,11 @@ static void test_nearly_full_heap(void) {
     size_t heap = 1024 * 1024;
     MiniVM *vm = make_vm(heap, 4096);
     run(vm, PRELUDE);
-    size_t slot = sizeof(Value);
+    /* slot counts as for 4-byte values: make_vm scales the heap with the value size */
     size_t per = (size_t)(heap * 0.88 / 400);
     char src[256];
     snprintf(src, sizeof(src), "(begin (define big (make-vector 400 0)) (fill-vectors! big %u) 1)",
-             (unsigned)((per - 8) / slot));
+             (unsigned)((per - 8) / 4));
     bool ok = run_int(vm, src) == 1;
     MiniStats s0 = stats(vm);
     ok = ok && run_int(vm, "(begin (churn 20000) (sum-first big))") == 399LL * 400 / 2;
@@ -176,7 +177,11 @@ static void test_fragmentation(void) {
     ok = run_int(vm,
         "(begin (set! keep #f) (set! keep2 #f) (churn 100)"
         " (define huge (make-vector 150000 3)) (vector-ref huge 149999))") == 3;
-    check("a 600 KB vector fits after everything is dropped", ok, "");
+    MiniStats st = stats(vm);
+    char note[120];
+    snprintf(note, sizeof(note), "%u minor, %u major (%u compacting)", (unsigned)st.minor_gcs,
+             (unsigned)st.major_gcs, (unsigned)st.compact_gcs);
+    check("a 600 KB vector fits after everything is dropped", ok, note);
     mini_destroy(vm);
 }
 
@@ -262,9 +267,68 @@ static void test_rolling_window(void) {
         " bad)") == 0;
     MiniStats st = stats(vm);
     char note[120];
-    snprintf(note, sizeof(note), "%u minor, %u major collections, %u MB allocated", (unsigned)st.minor_gcs,
-             (unsigned)st.major_gcs, (unsigned)(st.alloc_bytes >> 20));
+    snprintf(note, sizeof(note), "%u minor, %u major (%u compacting), %u MB allocated", (unsigned)st.minor_gcs,
+             (unsigned)st.major_gcs, (unsigned)st.compact_gcs, (unsigned)(st.alloc_bytes >> 20));
     check("60000 replacements, every item checked", ok, note);
+    mini_destroy(vm);
+}
+
+/* 7. A heap that starts small and grows to its limit */
+static void test_growing_heap(void) {
+    printf("\n--- 7. A heap growing from 64 KB to its limit ---\n");
+    MiniConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.initial_heap_bytes = 64 * 1024;
+    cfg.max_heap_bytes = 2u * 1024 * 1024 * (sizeof(Value) / 4);
+    cfg.eden_bytes = 8192;
+    cfg.skip_init_fasl = true;
+    MiniVM *vm = mini_create_ext(&cfg);
+    assert(vm != NULL);
+    mini_register_hardware_lib(vm);
+    Value init_code = msbc_deserialize(vm, init_msbc_data, init_msbc_len);
+    mini_vm_run(vm, mini_make_closure(vm, init_code, mini_nil()), 0, NULL);
+    run(vm, PRELUDE);
+    bool ok = run_int(vm,
+        "(begin (define keep (iota-list 40000)) (define big (make-vector 2000 0)) (fill-vectors! big 100)"
+        " (churn 30000) (define more (iota-list 30000)) (churn 30000)"
+        " (set! big #f) (churn 30000) (define v (make-vector 100000 2))"
+        " (+ (quotient (sum-list more) 4) (quotient (sum-list keep) 8) (vector-ref v 99999)))") ==
+        (29999LL * 30000 / 8) + (39999LL * 40000 / 16) + 2;
+    MiniStats st = stats(vm);
+    char note[140];
+    snprintf(note, sizeof(note), "heap %u KB, %u minor, %u major (%u compacting)", (unsigned)(st.heap_bytes / 1024),
+             (unsigned)st.minor_gcs, (unsigned)st.major_gcs, (unsigned)st.compact_gcs);
+    check("data survives the growth and the churn after it", ok, note);
+    mini_destroy(vm);
+}
+
+/* 8. Wide and deep structures: the mark stack and its overflow path */
+static void test_wide_structures(void) {
+    printf("\n--- 8. Wide and deep structures (mark stack) ---\n");
+    MiniVM *vm = make_vm(2u * 1024 * 1024, 4096);
+    run(vm, PRELUDE);
+    bool ok = run_int(vm,
+        "(begin"
+        " (define wide (make-vector 20000 0))"
+        " (let f ((i 0)) (if (< i 20000) (begin (vector-set! wide i (vector i (list i i))) (f (+ i 1)))))"
+        " (define (tree d) (if (= d 0) 1 (vector (tree (- d 1)) (tree (- d 1)))))"
+        " (define (count t) (if (vector? t) (+ (count (vector-ref t 0)) (count (vector-ref t 1))) t))"
+        " (define tr (tree 12))"
+        " (define lol (let loop ((i 0) (l '())) (if (= i 5000) l (loop (+ i 1) (cons (list i (vector i)) l)))))"
+        " (churn 60000)"
+        " (+ (count tr)"
+        "    (let f ((i 0) (s 0)) (if (< i 20000) (f (+ i 1) (+ s (car (vector-ref (vector-ref wide i) 1)))) s))"
+        "    (let f ((l lol) (s 0)) (if (null? l) s (f (cdr l) (+ s (vector-ref (cadr (car l)) 0)))))))") ==
+        4096 + (19999LL * 20000 / 2) + (4999LL * 5000 / 2);
+    for (int i = 0; i < 3 && ok; i++) {
+        mini_gc(vm);
+        ok = run_int(vm, "(begin (churn 2000) (count tr))") == 4096;
+    }
+    MiniStats st = stats(vm);
+    char note[120];
+    snprintf(note, sizeof(note), "%u minor, %u major (%u compacting)", (unsigned)st.minor_gcs,
+             (unsigned)st.major_gcs, (unsigned)st.compact_gcs);
+    check("wide vector, binary tree, list of lists", ok, note);
     mini_destroy(vm);
 }
 
@@ -297,6 +361,8 @@ int main(void) {
     test_old_to_young();
     test_exhaustion();
     test_rolling_window();
+    test_growing_heap();
+    test_wide_structures();
 
     mini_destroy(g_comp);
     printf("\n========================================================================\n");
