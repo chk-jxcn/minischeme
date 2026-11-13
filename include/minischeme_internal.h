@@ -327,6 +327,7 @@ struct MiniVM {
 
     size_t heap_size;
     size_t max_memory_bytes;
+    bool   heap_at_limit;      /* the last major GC wanted a larger heap and did not get one */
 
     /* Remembered Set (Tenured -> Eden pointers) */
     Value *remset;

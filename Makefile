@@ -20,7 +20,7 @@ LIB_OBJS = $(SRCS:src/%.c=$(BUILD)/%.o)
 MAIN_OBJ = $(BUILD)/minischeme_main.o
 CLI_OBJS = $(filter-out $(BUILD)/minischeme_vm.o,$(LIB_OBJS)) $(MAIN_OBJ)
 
-TESTS = $(BUILD)/test_compiler $(BUILD)/test_msbc $(BUILD)/test_stress
+TESTS = $(BUILD)/test_compiler $(BUILD)/test_msbc $(BUILD)/test_stress $(BUILD)/test_gc
 GEN = $(BUILD)/init_msbc.h $(BUILD)/compiler_msbc.h
 
 .PHONY: all clean test check
@@ -63,6 +63,7 @@ test: minischeme $(TESTS)
 	$(BUILD)/test_msbc
 	$(BUILD)/test_compiler
 	$(BUILD)/test_stress
+	$(BUILD)/test_gc
 
 check: test
 

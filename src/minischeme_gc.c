@@ -27,7 +27,7 @@
 static size_t s_word_iram = 0;
 
 void *mini_word_alloc(size_t bytes) {
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MALLOC_CAP_EXEC)   /* a chip with a word-only IRAM heap (ESP32) */
     /* EXEC|32BIT prefers the IRAM-only region; past it the allocator would
      * carve DRAM through its IRAM alias, which saves nothing */
     void *p = heap_caps_malloc(bytes, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
@@ -36,12 +36,16 @@ void *mini_word_alloc(size_t bytes) {
         return p;
     }
     if (p) heap_caps_free(p);
+#elif defined(ESP_PLATFORM)
+    /* no word-only heap (ESP32-S3): internal RAM, not PSRAM, for the stack and the frames */
+    void *p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (p) return p;
 #endif
     return malloc(bytes);
 }
 
 void mini_words_copy(void *dst, const void *src, size_t bytes) {
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MALLOC_CAP_EXEC)   /* a chip with a word-only IRAM heap (ESP32) */
     /* volatile: the compiler must not turn the loop back into memcpy */
     volatile uint32_t *d = (volatile uint32_t *)dst;
     const volatile uint32_t *s = (const volatile uint32_t *)src;
@@ -52,7 +56,7 @@ void mini_words_copy(void *dst, const void *src, size_t bytes) {
 }
 
 void mini_words_fill(void *dst, uint32_t value, size_t bytes) {
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MALLOC_CAP_EXEC)   /* a chip with a word-only IRAM heap (ESP32) */
     volatile uint32_t *d = (volatile uint32_t *)dst;
     for (size_t i = 0; i < bytes / 4; i++) d[i] = value;
 #else
@@ -71,7 +75,7 @@ void *mini_word_grow(void *old, size_t old_bytes, size_t new_bytes) {
     if (!p) return NULL;
     if (old) {
         mini_words_copy(p, old, old_bytes < new_bytes ? old_bytes : new_bytes);
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MALLOC_CAP_EXEC)   /* a chip with a word-only IRAM heap (ESP32) */
         if (esp_ptr_in_iram(old) && !esp_ptr_in_diram_iram(old)) {
             s_word_iram -= old_bytes < s_word_iram ? old_bytes : s_word_iram;
         }
@@ -101,7 +105,7 @@ void mini_vm_mem_owners(MiniVM *vm, MiniMemOwnerFn fn, void *user) {
 }
 
 char *alloc_aligned8(size_t size, char **raw_ptr) {
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(MALLOC_CAP_EXEC)   /* a chip with a word-only IRAM heap (ESP32) */
     char *raw = NULL;
     if (size >= 64 * 1024) {
         raw = (char *)heap_caps_malloc(size + 8, MALLOC_CAP_EXEC | MALLOC_CAP_8BIT);
@@ -117,6 +121,15 @@ char *alloc_aligned8(size_t size, char **raw_ptr) {
     if (!raw) {
         raw = (char *)heap_caps_malloc(size + 8, MALLOC_CAP_8BIT);
     }
+#elif defined(ESP_PLATFORM)
+    /* with PSRAM: the heap (large) goes there unless the build keeps it internal
+     * (VM_HEAP_INTERNAL); the eden and other small blocks stay in internal RAM */
+    char *raw = NULL;
+#if CONFIG_SPIRAM && !VM_HEAP_INTERNAL
+    if (size >= 16 * 1024) raw = (char *)heap_caps_malloc(size + 8, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+    if (!raw) raw = (char *)heap_caps_malloc(size + 8, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!raw) raw = (char *)malloc(size + 8);
 #else
     char *raw = (char *)malloc(size + 8);
 #endif
@@ -349,9 +362,11 @@ void minor_gc(MiniVM *vm, size_t needed_bytes) {
     vm->to_space = vm->tenured_start;
     vm->hp_limit = vm->tenured_limit;
 
-    /* Step 5: Check if Tenured space requires compaction */
+    /* Step 5: a heap that can still grow is collected (and grown) early, at 80%. One that
+     * cannot (at its limit, or no larger block to be had) waits until the next promotion
+     * does not fit: with more than 80% live it was collected in full after every minor GC */
     size_t tenured_used = (size_t)(vm->tenured_hp - vm->tenured_start);
-    if (tenured_used + needed_bytes + vm->eden_size > vm->tenured_size * 0.8) {
+    if (!vm->heap_at_limit && tenured_used + needed_bytes + vm->eden_size > vm->tenured_size * 0.8) {
         major_gc(vm, needed_bytes);
     }
 }
@@ -474,6 +489,7 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
     size_t eden_used = (size_t)(vm->eden_hp - vm->eden_start);
     size_t total_used = tenured_used + eden_used;
     size_t target_size = vm->tenured_size;
+    size_t old_size = vm->tenured_size;
 
     /* Check if Tenured space needs geometric expansion */
     if (total_used + needed_bytes + vm->eden_size > target_size * 0.75) {
@@ -491,6 +507,7 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
 
     char *target_raw = NULL;
     char *target_start = NULL;
+    bool wanted_more = total_used + needed_bytes + vm->eden_size > vm->tenured_size * 0.75;
 
     if (target_size != vm->tenured_size) {
         target_start = alloc_aligned8(target_size, &target_raw);
@@ -798,6 +815,8 @@ void major_gc(MiniVM *vm, size_t needed_bytes) {
     vm->tenured_hp = free_ptr;
     vm->tenured_limit = vm->tenured_start + vm->tenured_size;
     vm->heap_size = vm->tenured_size;
+    /* growth was due and did not happen: collecting early (minor_gc, step 5) gains nothing */
+    vm->heap_at_limit = wanted_more && target_size == old_size;
 
     /* Reset Eden generation to empty */
     vm->eden_hp = vm->eden_start;
