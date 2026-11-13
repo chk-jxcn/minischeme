@@ -273,6 +273,34 @@ static void test_rolling_window(void) {
     mini_destroy(vm);
 }
 
+/* 9. Medium objects (a few hundred bytes) kept one in four: the survivors leave holes of
+ *    1.2 KB, smaller than the eden, and the next ones must go into those holes */
+static void test_medium_holes(void) {
+    printf("\n--- 9. Medium objects into scattered holes ---\n");
+    MiniVM *vm = make_vm(1024 * 1024, 4096);
+    run(vm, PRELUDE);
+    bool ok = run_int(vm,
+        "(begin"
+        " (define (keepchurn n) (let loop ((i 0) (keep '()) (len 0))"
+        "    (if (= i n) len"
+        "        (let ((v (make-vector 100 i)))"
+        "          (if (= 0 (modulo i 4))"
+        "              (if (> len 900) (loop (+ i 1) (list v) 1) (loop (+ i 1) (cons v keep) (+ len 1)))"
+        "              (loop (+ i 1) keep len))))))"
+        " (define base (iota-list 20000))"
+        " (keepchurn 60000)"
+        " (sum-list base))") == 19999LL * 20000 / 2;
+    MiniStats st = stats(vm);
+    char note[140];
+    snprintf(note, sizeof(note), "%u minor, %u major (%u compacting)", (unsigned)st.minor_gcs,
+             (unsigned)st.major_gcs, (unsigned)st.compact_gcs);
+    check("data intact", ok, note);
+#if defined(MINI_GC_MARKSWEEP) && MINI_GC_MARKSWEEP
+    check("holes are reused without compacting", st.compact_gcs <= 2, note);
+#endif
+    mini_destroy(vm);
+}
+
 /* 7. A heap that starts small and grows to its limit */
 static void test_growing_heap(void) {
     printf("\n--- 7. A heap growing from 64 KB to its limit ---\n");
@@ -363,6 +391,7 @@ int main(void) {
     test_rolling_window();
     test_growing_heap();
     test_wide_structures();
+    test_medium_holes();
 
     mini_destroy(g_comp);
     printf("\n========================================================================\n");

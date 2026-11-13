@@ -274,12 +274,15 @@ static void ms_retire(MiniVM *vm, MsRegion *r, bool tail) {
 static void ms_retire_all(MiniVM *vm) {
     ms_retire(vm, &vm->ms_res, vm->ms_res_tail);
     vm->ms_res_tail = false;
+    for (unsigned i = vm->ms_resq_i; i < vm->ms_resq_n && i < MS_RESQ; i++) ms_retire(vm, &vm->ms_resq[i], false);
+    vm->ms_resq_i = vm->ms_resq_n = 0;
     ms_retire(vm, &vm->ms_small, false);
 }
 
 void mini_gc_heap_reset(MiniVM *vm) {
     ms_lists_reset(vm);
     vm->ms_res.ptr = vm->ms_res.end = NULL;
+    vm->ms_resq_i = vm->ms_resq_n = 0;
     vm->ms_small.ptr = vm->ms_small.end = NULL;
     vm->ms_res_tail = false;
     vm->ms_sweep = vm->ms_sweep_end = NULL;
@@ -336,21 +339,60 @@ static char *ms_take_fit(MsFree **list, size_t need, size_t max_scan, size_t *go
     return NULL;
 }
 
-/* A new chunk of at least `need` bytes for ms_res */
-static bool ms_find_reserve(MiniVM *vm, size_t need) {
-    size_t got = 0;
-    char *p = NULL;
-    if (need <= MS_MEDIUM_MAX) p = ms_take_fit(&vm->ms_medium, need, 16, &got);
-    if (!p) p = ms_take_fit(&vm->ms_big, need, (size_t)-1, &got);
-    if (p) {
-        ms_retire(vm, &vm->ms_res, vm->ms_res_tail);
-        vm->ms_res.ptr = p;
-        vm->ms_res.end = p + got;
-        vm->ms_res_tail = false;
+/* Bytes that objects of at most `largest` bytes can surely take from the reserve: every change
+ * of chunk may leave up to largest - 8 bytes unused */
+static size_t ms_reserve_usable(const MiniVM *vm, size_t largest) {
+    size_t total = (size_t)(vm->ms_res.end - vm->ms_res.ptr);
+    size_t waste = largest > 8 ? largest - 8 : 0;
+    for (unsigned i = vm->ms_resq_i; i < vm->ms_resq_n && i < MS_RESQ; i++) {
+        size_t len = (size_t)(vm->ms_resq[i].end - vm->ms_resq[i].ptr);
+        total += len > waste ? len - waste : 0;
+    }
+    return total;
+}
+
+/* A new reserve for `need` bytes of objects no larger than `largest`: free chunks of at least
+ * `largest` bytes each (holes between live objects will do), or the tail */
+static bool ms_find_reserve(MiniVM *vm, size_t need, size_t largest) {
+    MsRegion got[MS_RESQ + 1];
+    unsigned n = 0;
+    size_t usable = 0;
+    size_t waste = largest > 8 ? largest - 8 : 0;
+    ms_retire_all(vm);                       /* what is left of the old one may serve again */
+    /* holes first (the medium list), those that yield at least half their size; when they do
+     * not add up they go back and the large chunks are tried */
+    for (int pass = 0; pass < 2 && usable < need; pass++) {
+        MsFree **pp = pass == 0 ? &vm->ms_medium : &vm->ms_big;
+        size_t scan = pass == 0 ? 64 : (size_t)-1;
+        if (pass == 0 && largest > MS_MEDIUM_MAX) continue;
+        while (*pp && scan > 0 && n < MS_RESQ + 1 && usable < need) {
+            MsFree *f = *pp;
+            if (f->size >= largest && (pass == 1 || f->size >= 2 * waste)) {
+                *pp = f->next;
+                got[n].ptr = (char *)f;
+                got[n].end = (char *)f + f->size;
+                usable += n == 0 ? f->size : (f->size > waste ? f->size - waste : 0);
+                n++;
+            } else {
+                pp = &f->next;
+            }
+            scan--;
+        }
+        if (pass == 0 && usable < need) {
+            for (unsigned i = 0; i < n && i <= MS_RESQ; i++) ms_put(vm, got[i].ptr, (size_t)(got[i].end - got[i].ptr));
+            n = 0;
+            usable = 0;
+        }
+    }
+    if (usable >= need) {
+        vm->ms_res = got[0];
+        for (unsigned i = 1; i < n && i <= MS_RESQ; i++) vm->ms_resq[i - 1] = got[i];
+        vm->ms_resq_i = 0;
+        vm->ms_resq_n = (uint8_t)(n - 1);
         return true;
     }
-    if (!vm->ms_res_tail && (size_t)(vm->tenured_limit - vm->tenured_hp) >= need) {
-        ms_retire(vm, &vm->ms_res, false);
+    for (unsigned i = 0; i < n && i <= MS_RESQ; i++) ms_put(vm, got[i].ptr, (size_t)(got[i].end - got[i].ptr));
+    if ((size_t)(vm->tenured_limit - vm->tenured_hp) >= need) {
         vm->ms_res.ptr = vm->tenured_hp;
         vm->ms_res.end = vm->tenured_limit;
         vm->ms_res_tail = true;
@@ -360,25 +402,32 @@ static bool ms_find_reserve(MiniVM *vm, size_t need) {
 }
 
 /* Can every object of the eden be promoted? Each takes a hole of its size when there is one;
- * the rest must fit in ms_res (dead objects are counted too: an upper bound). Sweeps on while
- * that may still help. */
+ * the rest must fit in the reserve (dead objects are counted too: an upper bound). Sweeps on
+ * while that may still help. */
 static bool ms_room_for_eden(MiniVM *vm) {
     uint32_t need[MS_BINS];
-    size_t other = 0;
+    size_t other = 0, other_max = 0;
     memset(need, 0, sizeof(need));
     for (char *p = vm->eden_start; p < vm->eden_hp; ) {
         size_t sz = ALIGN8(((HeapObj *)p)->size);
-        if (sz >= MS_MIN_CHUNK && sz <= MS_SMALL_MAX) need[MS_BIN(sz)]++;
-        else other += sz;
+        if (sz >= MS_MIN_CHUNK && sz <= MS_SMALL_MAX) {
+            need[MS_BIN(sz)]++;
+        } else {
+            other += sz;
+            if (sz > other_max) other_max = sz;
+        }
         p += sz;
     }
     for (;;) {
-        size_t r = other;
+        size_t r = other, largest = other_max;
         for (unsigned b = 0; b < MS_BINS; b++) {
-            if (need[b] > vm->ms_bin_count[b]) r += (size_t)(need[b] - vm->ms_bin_count[b]) * MS_BIN_SIZE(b);
+            if (need[b] > vm->ms_bin_count[b]) {
+                r += (size_t)(need[b] - vm->ms_bin_count[b]) * MS_BIN_SIZE(b);
+                if (MS_BIN_SIZE(b) > largest) largest = MS_BIN_SIZE(b);
+            }
         }
-        if (r <= (size_t)(vm->ms_res.end - vm->ms_res.ptr)) return true;
-        if (ms_find_reserve(vm, r)) return true;
+        if (r <= ms_reserve_usable(vm, largest)) return true;
+        if (ms_find_reserve(vm, r, largest)) return true;
         if (!ms_sweeping(vm)) return false;
         ms_sweep_step(vm, MS_SWEEP_FORCED);
     }
@@ -408,9 +457,14 @@ static inline char *ms_alloc_young(MiniVM *vm, size_t sz) {
             return p;
         }
     }
-    if ((size_t)(vm->ms_res.end - vm->ms_res.ptr) < sz) {
-        fprintf(stderr, "minischeme: gc: promotion reserve exhausted\n");
-        abort();
+    while ((size_t)(vm->ms_res.end - vm->ms_res.ptr) < sz) {
+        if (vm->ms_resq_i >= vm->ms_resq_n) {
+            fprintf(stderr, "minischeme: gc: promotion reserve exhausted\n");
+            abort();
+        }
+        ms_retire(vm, &vm->ms_res, vm->ms_res_tail);   /* the next chunk lined up */
+        vm->ms_res_tail = false;
+        vm->ms_res = vm->ms_resq[vm->ms_resq_i++ & (MS_RESQ - 1)];
     }
     char *p = vm->ms_res.ptr;
     vm->ms_res.ptr += sz;

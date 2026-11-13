@@ -88,6 +88,7 @@ typedef struct MsRegion {          /* a chunk being handed out from its start */
 #define MS_BINS        31u
 #define MS_BIN(sz)     (((sz) >> 3) - 2u)
 #define MS_BIN_SIZE(b) (((b) + 2u) << 3)
+#define MS_RESQ        16u         /* chunks lined up behind the promotion reserve */
 
 typedef struct ForwardedObj {
     HeapObj header;
@@ -380,6 +381,9 @@ struct MiniVM {
     MsFree  *ms_medium;
     MsFree  *ms_big;
     MsRegion ms_res;           /* promotion falls back on it: checked to be large enough first */
+    MsRegion ms_resq[MS_RESQ]; /* whole free chunks that follow ms_res when it runs out */
+    uint8_t  ms_resq_n;
+    uint8_t  ms_resq_i;
     MsRegion ms_small;         /* small objects without a hole of their size */
     bool     ms_res_tail;      /* ms_res is the never-used space above tenured_hp */
     char    *ms_sweep;         /* chunks from here to ms_sweep_end still carry the last marks */
